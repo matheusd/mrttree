@@ -158,12 +158,14 @@ func TestRpcTest(t *testing.T) {
 			Amount:              1e8,
 			ProviderKey:         *providerKey,
 			ProviderSellableKey: *providerSellKey,
+			UserKey:             *userKey,
 			UserSellableKey:     *userSellKey,
 		}
 	}
 	proposal := &ProposedTree{
 		Leafs:           leafs,
 		LongLockTime:    7,
+		MediumLockTime:  5,
 		ShortLockTime:   3,
 		InitialLockTime: 10,
 		ChangeScript:    opTrueP2SHPkScript,
@@ -176,7 +178,7 @@ func TestRpcTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	debugTree(t, tree)
-	signSubtree(t, tree.Root, redeemBranchShortLockTime)
+	signSubtree(t, tree.Root, redeemBranchMediumLockTime)
 
 	// Publish and mine the funding tx.
 	fundingTxh := sendTx(tree.Tx)

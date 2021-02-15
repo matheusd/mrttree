@@ -20,18 +20,24 @@ import (
 //       IF
 //         DROP [short-csv]
 //       ELSE
-//         [long-key-hash] EQUALVERIFY
-//         [long-csv]
+//         DUP [medium-key-hash] EQUAL
+//         IF
+//           DROP [medium-csv]
+//         ELSE
+//           DUP [long-key-hash] EQUALVERIFY
+//           [long-csv]
+//         ENDIF
 //       ENDIF
 //       CHECKSEQUENCEVERIFY DROP
 //     ENDIF
 //     [schnorr-sig-type] CHECKSIGALT
-func nodeScript(longKey, shortKey, immediateKey *secp256k1.PublicKey,
-	longTimelock, shortTimelock uint32) ([]byte, error) {
+func nodeScript(longKey, mediumKey, shortKey, immediateKey *secp256k1.PublicKey,
+	longLockTime, mediumLockTime, shortLockTime uint32) ([]byte, error) {
 
 	var b txscript.ScriptBuilder
 
 	shortKeyHash := dcrutil.Hash160(shortKey.SerializeCompressed())
+	mediumKeyHash := dcrutil.Hash160(mediumKey.SerializeCompressed())
 	longKeyHash := dcrutil.Hash160(longKey.SerializeCompressed())
 	immediateKeyHash := dcrutil.Hash160(immediateKey.SerializeCompressed())
 
@@ -51,12 +57,23 @@ func nodeScript(longKey, shortKey, immediateKey *secp256k1.PublicKey,
 
 	b.AddOp(txscript.OP_IF)
 	b.AddOp(txscript.OP_DROP)
-	b.AddInt64(int64(shortTimelock))
+	b.AddInt64(int64(shortLockTime))
 
 	b.AddOp(txscript.OP_ELSE)
+	b.AddOp(txscript.OP_DUP)
+	b.AddData(mediumKeyHash)
+	b.AddOp(txscript.OP_EQUAL)
+
+	b.AddOp(txscript.OP_IF)
+	b.AddOp(txscript.OP_DROP)
+	b.AddInt64(int64(mediumLockTime))
+
+	b.AddOp(txscript.OP_ELSE)
+	b.AddOp(txscript.OP_DUP)
 	b.AddData(longKeyHash)
 	b.AddOp(txscript.OP_EQUALVERIFY)
-	b.AddInt64(int64(longTimelock))
+	b.AddInt64(int64(longLockTime))
+	b.AddOp(txscript.OP_ENDIF)
 	b.AddOp(txscript.OP_ENDIF)
 
 	b.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
@@ -88,7 +105,8 @@ func calcNodeTxFee(feeRate dcrutil.Amount) int64 {
 	var sig [65]byte
 	var pk [33]byte
 	maxLT := uint32(math.MaxUint32)
-	redeemScript, err := nodeScript(&zeroKey, &zeroKey, &zeroKey, maxLT, maxLT)
+	redeemScript, err := nodeScript(&zeroKey, &zeroKey, &zeroKey, &zeroKey,
+		maxLT, maxLT, maxLT)
 	if err != nil {
 		panic(err)
 	}
@@ -122,7 +140,8 @@ func calcLeafRedeemTxFee(feeRate dcrutil.Amount) int64 {
 	var sig [65]byte
 	var pk [33]byte
 	maxLT := uint32(math.MaxUint32)
-	redeemScript, err := nodeScript(&zeroKey, &zeroKey, &zeroKey, maxLT, maxLT)
+	redeemScript, err := nodeScript(&zeroKey, &zeroKey, &zeroKey, &zeroKey,
+		maxLT, maxLT, maxLT)
 	if err != nil {
 		panic(err)
 	}

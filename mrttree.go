@@ -12,6 +12,7 @@ import (
 type Node struct {
 	ProviderKey         secp256k1.PublicKey
 	ProviderSellableKey secp256k1.PublicKey
+	UserKey             secp256k1.PublicKey
 	UserSellableKey     secp256k1.PublicKey
 
 	Parent      *Node
@@ -26,24 +27,32 @@ type Node struct {
 	Tx *wire.MsgTx
 }
 
-func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey, *secp256k1.PublicKey) {
-	longKey := n.ProviderSellableKey
-	shortKey := addPubKeys(&n.ProviderSellableKey, &n.UserSellableKey)
+// ScriptKeys returns the long, medium, short and immediate keys (respectively)
+// for a given MRTTREE node.
+func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey,
+	*secp256k1.PublicKey, *secp256k1.PublicKey) {
+
+	longKey := n.ProviderKey
+	mediumKey := addPubKeys(&n.ProviderKey, &n.UserKey)
+	shortKey := addPubKeys(&n.ProviderSellableKey, &n.UserKey)
 	immediateKey := addPubKeys(&n.ProviderKey, &n.UserSellableKey)
 
-	return &longKey, &shortKey, &immediateKey
+	return &longKey, &mediumKey, &shortKey, &immediateKey
 }
 
 func (n *Node) RedeemScript() ([]byte, error) {
 	longLT := n.Tree.LongLockTime
+	mediumLT := n.Tree.MediumLockTime
 	shortLT := n.Tree.ShortLockTime
 	if n.Level == 0 {
 		longLT += n.Tree.InitialLockTime
+		mediumLT += n.Tree.InitialLockTime
 		shortLT += n.Tree.InitialLockTime
 	}
 
-	longKey, shortKey, immediateKey := n.ScriptKeys()
-	redeemScript, err := nodeScript(longKey, shortKey, immediateKey, longLT, shortLT)
+	longKey, mediumKey, shortKey, immediateKey := n.ScriptKeys()
+	redeemScript, err := nodeScript(longKey, mediumKey, shortKey,
+		immediateKey, longLT, mediumLT, shortLT)
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +74,7 @@ type Tree struct {
 	Levels uint32
 
 	LongLockTime    uint32
+	MediumLockTime  uint32
 	ShortLockTime   uint32
 	InitialLockTime uint32
 }
@@ -72,6 +82,7 @@ type Tree struct {
 type ProposedLeaf struct {
 	ProviderKey         secp256k1.PublicKey
 	ProviderSellableKey secp256k1.PublicKey
+	UserKey             secp256k1.PublicKey
 	UserSellableKey     secp256k1.PublicKey
 	Amount              dcrutil.Amount
 }
@@ -79,6 +90,7 @@ type ProposedLeaf struct {
 type ProposedTree struct {
 	Leafs           []ProposedLeaf
 	LongLockTime    uint32
+	MediumLockTime  uint32
 	ShortLockTime   uint32
 	InitialLockTime uint32
 
@@ -113,6 +125,7 @@ func BuildTree(proposal *ProposedTree) (*Tree, error) {
 		Tx:              fundTx,
 		Levels:          uint32(nbLevels),
 		LongLockTime:    proposal.LongLockTime,
+		MediumLockTime:  proposal.MediumLockTime,
 		ShortLockTime:   proposal.ShortLockTime,
 		InitialLockTime: proposal.InitialLockTime,
 	}
@@ -127,6 +140,7 @@ func BuildTree(proposal *ProposedTree) (*Tree, error) {
 			nodes[i] = Node{
 				ProviderKey:         leaf.ProviderKey,
 				ProviderSellableKey: leaf.ProviderSellableKey,
+				UserKey:             leaf.UserKey,
 				UserSellableKey:     leaf.UserSellableKey,
 				Amount:              leaf.Amount,
 			}
@@ -137,6 +151,8 @@ func BuildTree(proposal *ProposedTree) (*Tree, error) {
 				&child[1].ProviderKey)
 			nodes[i].ProviderSellableKey = addPubKeys(&child[0].ProviderSellableKey,
 				&child[1].ProviderSellableKey)
+			nodes[i].UserKey = addPubKeys(&child[0].UserKey,
+				&child[1].UserKey)
 			nodes[i].UserSellableKey = addPubKeys(&child[0].UserSellableKey,
 				&child[1].UserSellableKey)
 			nodes[i].Amount = child[0].Amount + child[1].Amount + nodeFee
@@ -190,10 +206,9 @@ func BuildTree(proposal *ProposedTree) (*Tree, error) {
 		outp := wire.NewOutPoint(parentTx.CachedTxHash(), parentOutput, 0)
 		in := wire.NewTxIn(outp, int64(nodes[i].Amount), nil)
 
-		// By default we redeem using the short lock time (the other
-		// branches allow the provider to redeem unilaterally by
-		// rewriting the subtree).
-		in.Sequence = proposal.ShortLockTime
+		// By default we redeem using the medum lock time, which is
+		// pre-signed by both user and provider.
+		in.Sequence = proposal.MediumLockTime
 		if i == 0 {
 			// The root tx also requires the full initial lock time
 			// to pass.

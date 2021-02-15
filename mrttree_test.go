@@ -11,13 +11,15 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrutil/v3"
 	"github.com/decred/dcrd/txscript/v3"
+	"github.com/decred/dcrd/wire"
 	"github.com/decred/slog"
 )
 
 const (
 	providerKeyInt     byte = 1
 	providerSellKeyInt      = 2
-	userSellKeyInt          = 3
+	userKeyInt              = 3
+	userSellKeyInt          = 4
 
 	defaultFeeRate dcrutil.Amount = 1e4
 	coin           int64          = 1e8
@@ -27,6 +29,7 @@ var (
 	dummyPkScript   = []byte{0x76, 0xa9, 0x14, 23: 0x88, 24: 0xac}
 	providerKey     = secp256k1.PrivKeyFromBytes([]byte{providerKeyInt}).PubKey()
 	providerSellKey = secp256k1.PrivKeyFromBytes([]byte{providerSellKeyInt}).PubKey()
+	userKey         = secp256k1.PrivKeyFromBytes([]byte{userKeyInt}).PubKey()
 	userSellKey     = secp256k1.PrivKeyFromBytes([]byte{userSellKeyInt}).PubKey()
 
 	simnetParams          = chaincfg.SimNetParams()
@@ -52,7 +55,7 @@ func debugTree(t *testing.T, tree *Tree) {
 	//t.Logf("fund tx: %s", spew.Sdump(tree.Tx))
 
 	print := func(n *Node) {
-		_, shortKey, _ := n.ScriptKeys()
+		_, _, shortKey, _ := n.ScriptKeys()
 		prefix := strings.Repeat("    ", int(n.Level))
 		t.Logf("%s lvl %d - %s pk %x", prefix, n.Level, n.Amount, shortKey.SerializeCompressed())
 		//t.Logf("tx: %s", spew.Sdump(n.Tx))
@@ -74,6 +77,7 @@ type redeemBranch int
 const (
 	redeemBranchImmediate redeemBranch = iota
 	redeemBranchShortLockTime
+	redeemBranchMediumLockTime
 	redeemBranchLongLockTime
 )
 
@@ -100,15 +104,22 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 		node.Tx.TxOut = node.Tx.TxOut[:1]
 		node.Tx.TxOut[0].PkScript = dummyPkScript
 
-	case redeemBranchShortLockTime:
-		// providerSellKey + userSellKey
-		privKeyInt = (providerSellKeyInt + userSellKeyInt) * nbKeys
+	case redeemBranchMediumLockTime:
+		// providerKey + userKey
+		privKeyInt = int(providerKeyInt+userKeyInt) * nbKeys
 
-		// When signing leaf nodes (which naturally only have a single
-		// output) fill in the dummy pkscript as output script.
+		// When signing leaf nodes (which naturally only have a single output) fill in
+		// the dummy pkscript as output script.
 		if len(node.Tx.TxOut) == 1 {
 			node.Tx.TxOut[0].PkScript = dummyPkScript
 		}
+
+	case redeemBranchShortLockTime:
+		// providerSellKey + userKey
+		privKeyInt = (providerSellKeyInt + userKeyInt) * nbKeys
+		node.Tx.TxIn[0].Sequence = 0
+		node.Tx.TxOut = node.Tx.TxOut[:1]
+		node.Tx.TxOut[0].PkScript = dummyPkScript
 
 	case redeemBranchLongLockTime:
 		// providerKey
@@ -152,6 +163,8 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	//logg.SetLevel(slog.LevelTrace)
 	txscript.UseLogger(logg)
 
+	t.Logf("XXXXX %x", redeemScript)
+
 	// Now verify.
 	scriptFlags := txscript.ScriptDiscourageUpgradableNops |
 		txscript.ScriptVerifyCheckLockTimeVerify |
@@ -193,14 +206,19 @@ func TestBuildTree(t *testing.T) {
 			Amount:              1e8,
 			ProviderKey:         *providerKey,
 			ProviderSellableKey: *providerSellKey,
+			UserKey:             *userKey,
 			UserSellableKey:     *userSellKey,
 		}
 	}
 	proposal := &ProposedTree{
+		Inputs: []*wire.TxIn{
+			{ValueIn: 10e8},
+		},
 		Leafs:           leafs,
-		LongLockTime:    10,
+		LongLockTime:    100,
+		MediumLockTime:  10,
 		ShortLockTime:   1,
-		InitialLockTime: 100,
+		InitialLockTime: 1000,
 	}
 
 	tree, err := BuildTree(proposal)
@@ -208,5 +226,5 @@ func TestBuildTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	debugTree(t, tree)
-	signSubtree(t, tree.Root, redeemBranchShortLockTime)
+	signSubtree(t, tree.Root, redeemBranchMediumLockTime)
 }
