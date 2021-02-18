@@ -21,6 +21,8 @@ type Node struct {
 	Children    [2]*Node
 	Level       uint32
 	Index       uint32
+	Leaf        bool
+	LeafCount   int
 
 	Amount dcrutil.Amount
 
@@ -68,6 +70,31 @@ func (n *Node) PkScript() ([]byte, error) {
 	return payToScriptHashScript(redeemScript), nil
 }
 
+type nodeStack []*Node
+
+func (stack *nodeStack) push(node *Node) {
+	*stack = append(*stack, node)
+}
+
+func (stack *nodeStack) pop() *Node {
+	n := (*stack)[len(*stack)-1]
+	*stack = (*stack)[:len(*stack)-1]
+	return n
+}
+
+func (stack *nodeStack) len() int {
+	return len(*stack)
+}
+
+func (stack *nodeStack) e(i int) *Node {
+	return (*stack)[i]
+}
+
+func makeNodeStack(capHint int) *nodeStack {
+	s := make(nodeStack, 0, capHint)
+	return &s
+}
+
 type Tree struct {
 	Root   *Node
 	Tx     *wire.MsgTx
@@ -99,92 +126,128 @@ type ProposedTree struct {
 	TxFeeRate    dcrutil.Amount
 }
 
-func BuildTree(proposal *ProposedTree) (*Tree, error) {
-	// TODO: assert proposal parameters are sane (lock times, fees,
-	// amounts, etc).
+func buildTree(tree *Tree, proposal *ProposedTree) error {
+	// Tx fee required at every node (automatically added to the node
+	// amount).
+	nodeFee := dcrutil.Amount(calcNodeTxFee(proposal.TxFeeRate))
 
-	// TODO: sort the leafs according to some cannonical ordering.
-
-	// TODO: Maybe support !square nb of leafs?
+	// The algo for building the trees uses two alternating stacks to track
+	// nodes at each level.
 	leafs := proposal.Leafs
 	nbLeafs := len(leafs)
-	if !isSquare(nbLeafs) {
-		return nil, fmt.Errorf("nb of leafs must be square")
+	stack0 := makeNodeStack(nbLeafs)
+	stack1 := makeNodeStack(nbLeafs)
+
+	// Push the leaves in reverse order to the first stack, initializing a
+	// new node as we go.
+	for i := nbLeafs - 1; i >= 0; i-- {
+		leaf := leafs[i]
+		node := &Node{
+			ProviderKey:         leaf.ProviderKey,
+			ProviderSellableKey: leaf.ProviderSellableKey,
+			UserKey:             leaf.UserKey,
+			UserSellableKey:     leaf.UserSellableKey,
+			Amount:              leaf.Amount,
+			Index:               uint32(i),
+			Tree:                tree,
+			Leaf:                true,
+			LeafCount:           1,
+		}
+		stack0.push(node)
+	}
+	i := nbLeafs
+
+	// Now zip pairs of nodes in alternating order until only the root is
+	// left.
+	dir := 0
+	tmp := make([]*Node, 0, 2)
+	for stack0.len() != 1 {
+		// Empty from stack0 into stack1 in pairs.
+		for stack0.len() > 0 {
+			tmp = append(tmp, stack0.pop())
+			if len(tmp) == 2 {
+				n0, n1 := tmp[dir], tmp[1-dir]
+
+				// Non-leaf keys are the sum of the child keys.
+				parent := &Node{
+					ProviderKey: addPubKeys(&n0.ProviderKey,
+						&n1.ProviderKey),
+					ProviderSellableKey: addPubKeys(&n0.ProviderSellableKey,
+						&n1.ProviderSellableKey),
+					UserKey: addPubKeys(&n0.UserKey,
+						&n1.UserKey),
+					UserSellableKey: addPubKeys(&n0.UserSellableKey,
+						&n1.UserSellableKey),
+					Amount:   n0.Amount + n1.Amount + nodeFee,
+					Children: [2]*Node{n0, n1},
+					Tree:     tree,
+					Index:    uint32(i),
+					LeafCount: n0.LeafCount +
+						n1.LeafCount,
+				}
+
+				// Fill in the parent data in the children.
+				n0.Parent = parent
+				n1.Parent = parent
+				n0.ParentIndex = 0
+				n1.ParentIndex = 1
+
+				stack1.push(parent)
+				tmp = tmp[:0]
+				i += 1
+			}
+		}
+
+		// If there's a single element left, push it as well, then swap
+		// the stacks.
+		if len(tmp) == 1 {
+			stack1.push(tmp[0])
+			tmp = tmp[:0]
+		}
+		stack0, stack1 = stack1, stack0
+
+		// Revert the direction we set children after popping from the
+		// stack so the leafs are maintained in the same order as they
+		// are input.
+		dir = 1 - dir
 	}
 
-	nbLevels := bits.TrailingZeros(uint(nbLeafs)) + 1
+	// Root is the single element left in the stack.
+	tree.Root = stack0.e(0)
 
+	// Setup the final level information, reusing stack0.
+	for stack0.len() > 0 {
+		n := stack0.pop()
+		if n.Parent != nil {
+			n.Level = n.Parent.Level + 1
+		}
+		if !n.Leaf {
+			stack0.push(n.Children[0])
+			stack0.push(n.Children[1])
+		}
+	}
+
+	return nil
+}
+
+func buildTreeTxs(tree *Tree, proposal *ProposedTree) error {
 	nodeFee := dcrutil.Amount(calcNodeTxFee(proposal.TxFeeRate))
 	leafRedeemFee := dcrutil.Amount(calcLeafRedeemTxFee(proposal.TxFeeRate))
-
-	nbNodes := (nbLeafs << 1) - 1
-	nodes := make([]Node, nbNodes)
-	fundTx := wire.NewMsgTx()
-	tree := &Tree{
-		Root:            &nodes[0],
-		Tx:              fundTx,
-		Levels:          uint32(nbLevels),
-		LongLockTime:    proposal.LongLockTime,
-		MediumLockTime:  proposal.MediumLockTime,
-		ShortLockTime:   proposal.ShortLockTime,
-		InitialLockTime: proposal.InitialLockTime,
-	}
-
-	// Setup the basic tree (starting from the end, where leafs are).
-	parentIdx := nbNodes - nbLeafs - 1
-	for i := nbNodes - 1; i >= 0; i-- {
-		if i >= nbNodes-nbLeafs {
-			// Still a leaf node, so fill in leaf data.
-			leafIdx := nbLeafs - (nbNodes - i)
-			leaf := leafs[leafIdx]
-			nodes[i] = Node{
-				ProviderKey:         leaf.ProviderKey,
-				ProviderSellableKey: leaf.ProviderSellableKey,
-				UserKey:             leaf.UserKey,
-				UserSellableKey:     leaf.UserSellableKey,
-				Amount:              leaf.Amount,
-			}
-		} else {
-			// Non-leaf keys are the sum of the child keys.
-			child := nodes[i].Children
-			nodes[i].ProviderKey = addPubKeys(&child[0].ProviderKey,
-				&child[1].ProviderKey)
-			nodes[i].ProviderSellableKey = addPubKeys(&child[0].ProviderSellableKey,
-				&child[1].ProviderSellableKey)
-			nodes[i].UserKey = addPubKeys(&child[0].UserKey,
-				&child[1].UserKey)
-			nodes[i].UserSellableKey = addPubKeys(&child[0].UserSellableKey,
-				&child[1].UserSellableKey)
-			nodes[i].Amount = child[0].Amount + child[1].Amount + nodeFee
-		}
-
-		nodes[i].Level = uint32(31 - bits.LeadingZeros32(uint32(i+1)))
-		nodes[i].Tree = tree
-		nodes[i].Index = uint32(i)
-
-		// Fill in parent data while not at root.
-		if i > 0 {
-			parent := &nodes[parentIdx]
-			childIdx := (i + 1) % 2
-			parent.Children[childIdx] = &nodes[i]
-			nodes[i].Parent = parent
-			parentIdx += childIdx - 1
-			nodes[i].ParentIndex = childIdx
-		}
-	}
-
-	root := &nodes[0]
-	rootScript, err := root.PkScript()
-	if err != nil {
-		return nil, err
-	}
+	root := tree.Root
 
 	// Build the funding tx.
+	fundTx := wire.NewMsgTx()
+	tree.Tx = fundTx
+	rootScript, err := root.PkScript()
+	if err != nil {
+		return err
+	}
+
 	inAmount := sumInputAmounts(proposal.Inputs)
 	outAmount := int64(root.Amount)
 	changeAmount := inAmount - outAmount - int64(nodeFee)
 	if changeAmount < 0 { // TODO: handle dust
-		return nil, fmt.Errorf("not enough input funds")
+		return fmt.Errorf("not enough input funds")
 	}
 
 	fundTx.TxIn = proposal.Inputs
@@ -192,51 +255,90 @@ func BuildTree(proposal *ProposedTree) (*Tree, error) {
 	fundTx.AddTxOut(wire.NewTxOut(changeAmount, proposal.ChangeScript))
 
 	// Build each node tx.
-	for i := 0; i < nbNodes; i++ {
+	stack := makeNodeStack(len(proposal.Leafs))
+	stack.push(tree.Root)
+	for stack.len() > 0 {
+		node := stack.pop()
+
 		parentTx := fundTx
 		var parentOutput uint32
-		if i > 0 {
-			parentTx = nodes[i].Parent.Tx
-			parentOutput = uint32(nodes[i].ParentIndex)
+		if node.Parent != nil {
+			parentTx = node.Parent.Tx
+			parentOutput = uint32(node.ParentIndex)
 		}
 
 		tx := wire.NewMsgTx()
-		nodes[i].Tx = tx
+		node.Tx = tx
 		tx.Version = 2
 		outp := wire.NewOutPoint(parentTx.CachedTxHash(), parentOutput, 0)
-		in := wire.NewTxIn(outp, int64(nodes[i].Amount), nil)
+		in := wire.NewTxIn(outp, int64(node.Amount), nil)
 
-		// By default we redeem using the medum lock time, which is
+		// By default we redeem using the medium lock time, which is
 		// pre-signed by both user and provider.
 		in.Sequence = proposal.MediumLockTime
-		if i == 0 {
+		if node.Parent == nil {
 			// The root tx also requires the full initial lock time
 			// to pass.
 			in.Sequence += proposal.InitialLockTime
 		}
 		tx.AddTxIn(in)
 
-		if nodes[i].Children[0] == nil {
+		if node.Leaf {
 			// For the leaf txs, add a dummy output that will be
 			// filled by users.
-			tx.AddTxOut(wire.NewTxOut(int64(nodes[i].Amount-leafRedeemFee), []byte{}))
+			tx.AddTxOut(wire.NewTxOut(int64(node.Amount-leafRedeemFee), []byte{}))
 			continue
 		}
 
 		// For non-leaf txs, add outputs for both children.
 
-		c0, c1 := nodes[i].Children[0], nodes[i].Children[1]
+		c0, c1 := node.Children[0], node.Children[1]
 		c0Script, err := c0.PkScript()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		c1Script, err := c1.PkScript()
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		tx.AddTxOut(wire.NewTxOut(int64(c0.Amount), c0Script))
 		tx.AddTxOut(wire.NewTxOut(int64(c1.Amount), c1Script))
+
+		stack.push(node.Children[0])
+		stack.push(node.Children[1])
+	}
+
+	return nil
+}
+
+func BuildTree(proposal *ProposedTree) (*Tree, error) {
+	// TODO: assert proposal parameters are sane (lock times, fees,
+	// amounts, etc).
+
+	// TODO: sort the leafs according to some cannonical ordering.
+
+	leafs := proposal.Leafs
+	nbLeafs := len(leafs)
+	if nbLeafs == 0 {
+		return nil, fmt.Errorf("empty tree")
+	}
+
+	nbLevels := 33 - bits.LeadingZeros32(uint32(nbLeafs-1))
+
+	tree := &Tree{
+		Levels:          uint32(nbLevels),
+		LongLockTime:    proposal.LongLockTime,
+		MediumLockTime:  proposal.MediumLockTime,
+		ShortLockTime:   proposal.ShortLockTime,
+		InitialLockTime: proposal.InitialLockTime,
+	}
+
+	if err := buildTree(tree, proposal); err != nil {
+		return nil, err
+	}
+	if err := buildTreeTxs(tree, proposal); err != nil {
+		return nil, err
 	}
 
 	return tree, nil

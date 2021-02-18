@@ -57,7 +57,8 @@ func debugTree(t *testing.T, tree *Tree) {
 	print := func(n *Node) {
 		_, _, shortKey, _ := n.ScriptKeys()
 		prefix := strings.Repeat("    ", int(n.Level))
-		t.Logf("%s lvl %d - %s pk %x", prefix, n.Level, n.Amount, shortKey.SerializeCompressed())
+		t.Logf("%s lvl %d (idx %d) - %s pk %x", prefix, n.Level,
+			n.Index, n.Amount, shortKey.SerializeCompressed())
 		//t.Logf("tx: %s", spew.Sdump(n.Tx))
 	}
 
@@ -85,6 +86,10 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	// Determine how many copies of the test key are needed to sign at this
 	// level.
 	nbKeys := 1 << (node.Tree.Levels - node.Level - 1)
+	t.Logf("leaf count %d", node.LeafCount)
+	t.Logf("nb keys: %d", nbKeys)
+	nbKeys = node.LeafCount
+	//nbKeys := node.ChildrenCount + 1
 
 	// Test private keys are simple ints, so just figure out which redeem
 	// branch is being used and multiply by the nb of keys.
@@ -191,8 +196,16 @@ func signSubtree(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	}
 }
 
+func TestNodeFees(t *testing.T) {
+	feeRate := dcrutil.Amount(1e4)
+	nodeFeeRate := calcNodeTxFee(feeRate)
+	leafFeeRate := calcLeafRedeemTxFee(feeRate)
+	t.Logf("XXXXX node fee %s", dcrutil.Amount(nodeFeeRate))
+	t.Logf("XXXXX leaf fee %s", dcrutil.Amount(leafFeeRate))
+}
+
 func TestBuildTree(t *testing.T) {
-	leafs := make([]ProposedLeaf, 4)
+	leafs := make([]ProposedLeaf, 9)
 
 	/*
 		for i := 0; i < 36; i++ {
@@ -212,7 +225,7 @@ func TestBuildTree(t *testing.T) {
 	}
 	proposal := &ProposedTree{
 		Inputs: []*wire.TxIn{
-			{ValueIn: 10e8},
+			{ValueIn: 100e8},
 		},
 		Leafs:           leafs,
 		LongLockTime:    100,

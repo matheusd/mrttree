@@ -1,15 +1,9 @@
 package mrttree
 
 import (
-	"math/bits"
-
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/wire"
 )
-
-func isSquare(i int) bool {
-	return i > 1 && bits.OnesCount(uint(i)) == 1
-}
 
 func addPubKeys(p1, p2 *secp256k1.PublicKey) secp256k1.PublicKey {
 	var pj1, pj2, res secp256k1.JacobianPoint

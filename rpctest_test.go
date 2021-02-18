@@ -141,7 +141,7 @@ func TestRpcTest(t *testing.T) {
 		}
 	}
 
-	const nbLeafs = 4
+	const nbLeafs = 9
 
 	// Create the output to fund the mrttree funding tx.
 	inputAmount := coin * nbLeafs * 2 // * to add enough for tx fees.
