@@ -5,6 +5,7 @@ import (
 	"math/bits"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
+	"github.com/decred/dcrd/dcrec/secp256k1/v3/schnorr"
 	"github.com/decred/dcrd/dcrutil/v3"
 	"github.com/decred/dcrd/wire"
 )
@@ -14,6 +15,7 @@ type Node struct {
 	ProviderSellableKey secp256k1.PublicKey
 	UserKey             secp256k1.PublicKey
 	UserSellableKey     secp256k1.PublicKey
+	FundKey             secp256k1.PublicKey
 
 	Parent      *Node
 	ParentIndex int
@@ -26,35 +28,28 @@ type Node struct {
 
 	Amount dcrutil.Amount
 
-	Tx *wire.MsgTx
+	Tx         *wire.MsgTx
+	PrevOutput *wire.TxOut
 }
 
-// ScriptKeys returns the long, medium, short and immediate keys (respectively)
-// for a given MRTTREE node.
-func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey,
-	*secp256k1.PublicKey, *secp256k1.PublicKey) {
+// ScriptKeys returns the locked and immediate keys (respectively) for a given
+// MRTTREE node.
+func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey) {
 
-	longKey := n.ProviderKey
-	mediumKey := addPubKeys(&n.ProviderKey, &n.UserKey)
-	shortKey := addPubKeys(&n.ProviderSellableKey, &n.UserKey)
+	lockedKey := n.UserKey
 	immediateKey := addPubKeys(&n.ProviderKey, &n.UserSellableKey)
 
-	return &longKey, &mediumKey, &shortKey, &immediateKey
+	return &lockedKey, &immediateKey
 }
 
 func (n *Node) RedeemScript() ([]byte, error) {
-	longLT := n.Tree.LongLockTime
-	mediumLT := n.Tree.MediumLockTime
-	shortLT := n.Tree.ShortLockTime
+	lockTime := n.Tree.LockTime
 	if n.Level == 0 {
-		longLT += n.Tree.InitialLockTime
-		mediumLT += n.Tree.InitialLockTime
-		shortLT += n.Tree.InitialLockTime
+		lockTime += n.Tree.InitialLockTime
 	}
 
-	longKey, mediumKey, shortKey, immediateKey := n.ScriptKeys()
-	redeemScript, err := nodeScript(longKey, mediumKey, shortKey,
-		immediateKey, longLT, mediumLT, shortLT)
+	lockedKey, immediateKey := n.ScriptKeys()
+	redeemScript, err := nodeScript(lockedKey, immediateKey, lockTime)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +63,35 @@ func (n *Node) PkScript() ([]byte, error) {
 		return nil, err
 	}
 	return payToScriptHashScript(redeemScript), nil
+}
+
+func (n *Node) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k1.ModNScalar) error {
+	var R secp256k1.JacobianPoint
+	RPub.AsJacobian(&R)
+	sig := schnorr.NewSignature(&R.X, s)
+	pub, _ := n.ScriptKeys()
+	redeemScript, err := n.RedeemScript()
+	if err != nil {
+		return err
+	}
+
+	n.Tx.TxIn[0].SignatureScript, err = nodeSigScript(sig, pub, redeemScript)
+	return err
+}
+
+func (n *Node) SubtreeUserLeafKeys() []*secp256k1.PublicKey {
+	stack := nodeStack{n}
+	keys := make([]*secp256k1.PublicKey, 0, 1<<(n.Tree.Levels-n.Level-1))
+	for len(stack) > 0 {
+		p := stack.pop()
+		if p.Leaf {
+			keys = append(keys, &p.UserKey)
+		} else {
+			stack.push(p.Children[0])
+			stack.push(p.Children[1])
+		}
+	}
+	return keys
 }
 
 type nodeStack []*Node
@@ -95,15 +119,121 @@ func makeNodeStack(capHint int) *nodeStack {
 	return &s
 }
 
-type Tree struct {
-	Root   *Node
-	Tx     *wire.MsgTx
-	Levels uint32
+type LeafPubKeyMap map[secp256k1.PublicKey][]*Node
 
-	LongLockTime    uint32
-	MediumLockTime  uint32
-	ShortLockTime   uint32
+// AncestorBranchesCount returns a map that counts how many times branch nodes
+// are ancestors of leaf nodes which UserKeys are in the passed userLeafKeys.
+//
+// This assumes every passed key can actually be found in the leaf pubkey map.
+// In particular, repeated leaf keys must be found the exact number of times in
+// the leaf map. If this assumption is not held, this function errors.
+func (m LeafPubKeyMap) AncestorBranchesCount(userLeafKeys []*secp256k1.PublicKey) (map[uint32]int, error) {
+	leftOverNodes := make(map[secp256k1.PublicKey][]*Node)
+	res := make(map[uint32]int, len(userLeafKeys))
+	for _, targetKey := range userLeafKeys {
+		nodes := leftOverNodes[*targetKey]
+		if nodes == nil {
+			nodes = m[*targetKey]
+			if nodes == nil {
+				return nil, fmt.Errorf("key not used in any leaf: %x",
+					targetKey.SerializeCompressed())
+			}
+		}
+		if len(nodes) == 0 {
+			return nil, fmt.Errorf("no more nodes left for key %x",
+				targetKey.SerializeCompressed())
+		}
+
+		// Traverse the tree up, incrementing the count on visited
+		// nodes.
+		n := nodes[0].Parent
+		for n != nil {
+			res[n.Index] += 1
+			n = n.Parent
+		}
+
+		// Handle advancing. If the same key was used in multiple
+		// leaves, keep track of which ones we haven't visited yet and
+		// make sure we don't visit twice the same key.
+		leftOverNodes[*targetKey] = nodes[1:]
+	}
+
+	// Ensure no keys were left over (that is, repeated keys were found the
+	// correct number of times).
+	for key, nodes := range leftOverNodes {
+		if len(nodes) != 0 {
+			return nil, fmt.Errorf("key %x has %d left over nodes",
+				key.SerializeCompressed(), len(nodes))
+		}
+	}
+
+	return res, nil
+}
+
+type Tree struct {
+	Root      *Node
+	PrefundTx *wire.MsgTx
+	Tx        *wire.MsgTx
+	Levels    uint32
+	Leafs     []*Node
+	Nodes     []*Node
+	ChangeKey secp256k1.PublicKey
+
+	LockTime        uint32
 	InitialLockTime uint32
+	FundLockTime    uint32
+}
+
+// FundKey returns the group key used to spend the prefund output in the fund
+// tx.
+func (tree *Tree) FundKey() *secp256k1.PublicKey {
+	fundKey := tree.Leafs[0].FundKey
+	for i := 1; i < len(tree.Leafs); i++ {
+		fundKey = addPubKeys(&fundKey, &tree.Leafs[i].FundKey)
+	}
+	return &fundKey
+}
+
+// FundScript returns the redeemScript of the prefund tx output, spent in the
+// fund tx.
+func (tree *Tree) FundScript() ([]byte, error) {
+	fundKey := tree.FundKey()
+	return fundScript(fundKey, &tree.ChangeKey, tree.FundLockTime)
+}
+
+func (tree *Tree) FundP2SH() ([]byte, error) {
+	fundScript, err := tree.FundScript()
+	if err != nil {
+		return nil, err
+	}
+	fundP2SH := payToScriptHashScript(fundScript)
+	return fundP2SH, nil
+}
+
+// BuildLeafPubKeyMap returns a map that lists every user pubkey to the leaf(s)
+// they are involved in. The same pubkey might be involved in multiple leafs in
+// case it is repetead.
+func (tree *Tree) BuildLeafPubKeyMap() LeafPubKeyMap {
+	res := make(LeafPubKeyMap, len(tree.Leafs))
+	for _, leaf := range tree.Leafs {
+		nodes := res[leaf.UserKey]
+		res[leaf.UserKey] = append(nodes, leaf)
+	}
+	return res
+}
+
+func (tree *Tree) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k1.ModNScalar) error {
+	var R secp256k1.JacobianPoint
+	RPub.AsJacobian(&R)
+	sig := schnorr.NewSignature(&R.X, s)
+	pub := tree.FundKey()
+	redeemScript, err := tree.FundScript()
+	if err != nil {
+		return err
+	}
+
+	tree.Tx.TxIn[0].SignatureScript, err = fundSigScript(sig, pub, redeemScript)
+	return err
 }
 
 type ProposedLeaf struct {
@@ -112,18 +242,19 @@ type ProposedLeaf struct {
 	UserKey             secp256k1.PublicKey
 	UserSellableKey     secp256k1.PublicKey
 	Amount              dcrutil.Amount
+	FundKey             secp256k1.PublicKey
 }
 
 type ProposedTree struct {
 	Leafs           []ProposedLeaf
-	LongLockTime    uint32
-	MediumLockTime  uint32
-	ShortLockTime   uint32
+	LockTime        uint32
 	InitialLockTime uint32
+	FundLockTime    uint32
 
-	Inputs       []*wire.TxIn
-	ChangeScript []byte
-	TxFeeRate    dcrutil.Amount
+	PrefundInputs []*wire.TxIn
+	Inputs        []*wire.TxIn
+	ChangeKey     secp256k1.PublicKey
+	TxFeeRate     dcrutil.Amount
 }
 
 func buildTree(tree *Tree, proposal *ProposedTree) error {
@@ -138,6 +269,9 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 	stack0 := makeNodeStack(nbLeafs)
 	stack1 := makeNodeStack(nbLeafs)
 
+	tree.Leafs = make([]*Node, nbLeafs)
+	tree.Nodes = make([]*Node, CalcTreeTxs(nbLeafs)+nbLeafs)
+
 	// Push the leaves in reverse order to the first stack, initializing a
 	// new node as we go.
 	for i := nbLeafs - 1; i >= 0; i-- {
@@ -147,6 +281,7 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 			ProviderSellableKey: leaf.ProviderSellableKey,
 			UserKey:             leaf.UserKey,
 			UserSellableKey:     leaf.UserSellableKey,
+			FundKey:             leaf.FundKey,
 			Amount:              leaf.Amount,
 			Index:               uint32(i),
 			Tree:                tree,
@@ -154,6 +289,8 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 			LeafCount:           1,
 		}
 		stack0.push(node)
+		tree.Leafs[i] = node
+		tree.Nodes[i] = node
 	}
 	i := nbLeafs
 
@@ -185,6 +322,8 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 					LeafCount: n0.LeafCount +
 						n1.LeafCount,
 				}
+
+				tree.Nodes[i] = parent
 
 				// Fill in the parent data in the children.
 				n0.Parent = parent
@@ -227,6 +366,39 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 		}
 	}
 
+	// Sanity check.
+	if tree.Nodes[len(tree.Nodes)-1] == nil {
+		return fmt.Errorf("assertion error: empty nodes in Nodes list")
+	}
+
+	return nil
+}
+
+func buildPrefundTx(tree *Tree, proposal *ProposedTree) error {
+	fundP2SH, err := tree.FundP2SH()
+	if err != nil {
+		return err
+	}
+
+	nodeFee := calcNodeTxFee(proposal.TxFeeRate)
+	prefundTxFee := calcPrefundTxFee(proposal.TxFeeRate, len(proposal.PrefundInputs))
+	fundTxFee := calcFundTxFee(proposal.TxFeeRate, 0)
+	inAmount := sumInputAmounts(proposal.PrefundInputs)
+	outAmount := int64(tree.Root.Amount) + nodeFee + fundTxFee
+	changeAmount := inAmount - outAmount - prefundTxFee
+
+	if changeAmount < 6030 { // TODO: handle change < dust
+		return fmt.Errorf("not enough input funds for prefund tx (change %d)", changeAmount)
+	}
+
+	changeScript := payToPubKeyHashScript(&proposal.ChangeKey)
+
+	tx := wire.NewMsgTx()
+	tx.TxIn = proposal.PrefundInputs
+	tx.AddTxOut(wire.NewTxOut(outAmount, fundP2SH))
+	tx.AddTxOut(wire.NewTxOut(changeAmount, changeScript))
+	tree.PrefundTx = tx
+
 	return nil
 }
 
@@ -236,23 +408,25 @@ func buildTreeTxs(tree *Tree, proposal *ProposedTree) error {
 	root := tree.Root
 
 	// Build the funding tx.
-	fundTx := wire.NewMsgTx()
-	tree.Tx = fundTx
 	rootScript, err := root.PkScript()
 	if err != nil {
 		return err
 	}
 
-	inAmount := sumInputAmounts(proposal.Inputs)
-	outAmount := int64(root.Amount)
-	changeAmount := inAmount - outAmount - int64(nodeFee)
-	if changeAmount < 0 { // TODO: handle dust
-		return fmt.Errorf("not enough input funds")
+	fundTxFee := calcFundTxFee(proposal.TxFeeRate, 0)
+	inAmount := tree.PrefundTx.TxOut[0].Value
+	outAmount := int64(root.Amount) + int64(nodeFee)
+	changeAmount := inAmount - outAmount - fundTxFee
+	if changeAmount != 0 {
+		return fmt.Errorf("wrong set of input and output amounts (change %d)", changeAmount)
 	}
 
-	fundTx.TxIn = proposal.Inputs
+	fundTx := wire.NewMsgTx()
+	fundTx.Version = 2
+	prefundPrevOut := &wire.OutPoint{Hash: tree.PrefundTx.TxHash()}
+	fundTx.AddTxIn(wire.NewTxIn(prefundPrevOut, inAmount, nil))
 	fundTx.AddTxOut(wire.NewTxOut(int64(root.Amount), rootScript))
-	fundTx.AddTxOut(wire.NewTxOut(changeAmount, proposal.ChangeScript))
+	tree.Tx = fundTx
 
 	// Build each node tx.
 	stack := makeNodeStack(len(proposal.Leafs))
@@ -266,6 +440,7 @@ func buildTreeTxs(tree *Tree, proposal *ProposedTree) error {
 			parentTx = node.Parent.Tx
 			parentOutput = uint32(node.ParentIndex)
 		}
+		node.PrevOutput = parentTx.TxOut[parentOutput]
 
 		tx := wire.NewMsgTx()
 		node.Tx = tx
@@ -275,7 +450,7 @@ func buildTreeTxs(tree *Tree, proposal *ProposedTree) error {
 
 		// By default we redeem using the medium lock time, which is
 		// pre-signed by both user and provider.
-		in.Sequence = proposal.MediumLockTime
+		in.Sequence = proposal.LockTime
 		if node.Parent == nil {
 			// The root tx also requires the full initial lock time
 			// to pass.
@@ -320,26 +495,49 @@ func BuildTree(proposal *ProposedTree) (*Tree, error) {
 
 	leafs := proposal.Leafs
 	nbLeafs := len(leafs)
-	if nbLeafs == 0 {
-		return nil, fmt.Errorf("empty tree")
+	if nbLeafs < 2 {
+		return nil, fmt.Errorf("too few leafs")
 	}
 
 	nbLevels := 33 - bits.LeadingZeros32(uint32(nbLeafs-1))
 
 	tree := &Tree{
 		Levels:          uint32(nbLevels),
-		LongLockTime:    proposal.LongLockTime,
-		MediumLockTime:  proposal.MediumLockTime,
-		ShortLockTime:   proposal.ShortLockTime,
+		LockTime:        proposal.LockTime,
 		InitialLockTime: proposal.InitialLockTime,
+		FundLockTime:    proposal.FundLockTime,
+		ChangeKey:       proposal.ChangeKey,
 	}
 
 	if err := buildTree(tree, proposal); err != nil {
 		return nil, err
 	}
+
+	if err := buildPrefundTx(tree, proposal); err != nil {
+		return nil, err
+	}
+
 	if err := buildTreeTxs(tree, proposal); err != nil {
 		return nil, err
 	}
 
 	return tree, nil
+}
+
+// Calc the number of intermediate nodes/transctions in the tree. This does
+// _NOT_ account for the leaf nodes themselves.
+func CalcTreeTxs(nbLeafs int) int {
+	// Simulate the tree building algo to figure out the total nb of txs.
+	var stack, totalTxs int
+	stack = nbLeafs
+	for stack > 1 {
+		totalTxs += stack / 2
+		stack = (stack / 2) + (stack % 2)
+	}
+	return totalTxs
+}
+
+func CalcMaxTreeDepth(nbLeafs int) int {
+	nbLevels := 33 - bits.LeadingZeros32(uint32(nbLeafs-1))
+	return nbLevels
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/dcrutil/v3"
 	"github.com/decred/dcrd/rpcclient/v6"
 	"github.com/decred/dcrd/rpctest"
 	"github.com/decred/dcrd/wire"
@@ -143,8 +144,8 @@ func TestRpcTest(t *testing.T) {
 
 	const nbLeafs = 9
 
-	// Create the output to fund the mrttree funding tx.
-	inputAmount := coin * nbLeafs * 2 // * to add enough for tx fees.
+	// Create the output to fund the mrttree pre-fund tx.
+	inputAmount := coin * nbLeafs * 2 // * 2 to add enough for tx fees.
 	targetOut := wire.NewTxOut(inputAmount, opTrueP2SHPkScript)
 	inputTx, err := hn.SendOutputs([]*wire.TxOut{targetOut}, defaultFeeRate)
 	require.NoError(t, err)
@@ -155,21 +156,19 @@ func TestRpcTest(t *testing.T) {
 	leafs := make([]ProposedLeaf, nbLeafs)
 	for i := 0; i < len(leafs); i++ {
 		leafs[i] = ProposedLeaf{
-			Amount:              1e8,
+			Amount:              dcrutil.Amount(coin),
 			ProviderKey:         *providerKey,
 			ProviderSellableKey: *providerSellKey,
 			UserKey:             *userKey,
 			UserSellableKey:     *userSellKey,
+			FundKey:             *fundKey,
 		}
 	}
 	proposal := &ProposedTree{
 		Leafs:           leafs,
-		LongLockTime:    7,
-		MediumLockTime:  5,
-		ShortLockTime:   3,
+		LockTime:        3,
 		InitialLockTime: 10,
-		ChangeScript:    opTrueP2SHPkScript,
-		Inputs:          treeInputs,
+		PrefundInputs:   treeInputs,
 		TxFeeRate:       defaultFeeRate,
 	}
 
@@ -178,9 +177,16 @@ func TestRpcTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	debugTree(t, tree)
-	signSubtree(t, tree.Root, redeemBranchMediumLockTime)
+	signSubtree(t, tree.Root, redeemBranchLocked)
 
-	// Publish and mine the funding tx.
+	// Publish and mine the pre-fund tx.
+	prefundTxh := sendTx(tree.PrefundTx)
+	mine(1)
+	assertMined(prefundTxh)
+	t.Logf("Mined pre-fund tx %s", prefundTxh)
+
+	// Sign, publish and mine the funding tx.
+	signFundTx(t, tree)
 	fundingTxh := sendTx(tree.Tx)
 	mine(1)
 	assertMined(fundingTxh)

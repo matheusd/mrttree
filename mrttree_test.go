@@ -20,6 +20,7 @@ const (
 	providerSellKeyInt      = 2
 	userKeyInt              = 3
 	userSellKeyInt          = 4
+	fundKeyInt              = 5
 
 	defaultFeeRate dcrutil.Amount = 1e4
 	coin           int64          = 1e8
@@ -31,12 +32,21 @@ var (
 	providerSellKey = secp256k1.PrivKeyFromBytes([]byte{providerSellKeyInt}).PubKey()
 	userKey         = secp256k1.PrivKeyFromBytes([]byte{userKeyInt}).PubKey()
 	userSellKey     = secp256k1.PrivKeyFromBytes([]byte{userSellKeyInt}).PubKey()
+	fundKey         = secp256k1.PrivKeyFromBytes([]byte{fundKeyInt}).PubKey()
 
 	simnetParams          = chaincfg.SimNetParams()
 	opTrueScript          = []byte{txscript.OP_TRUE}
 	opTrueRedeemScript    = []byte{txscript.OP_DATA_1, txscript.OP_TRUE}
 	opTrueP2SHAddr, _     = dcrutil.NewAddressScriptHash(opTrueScript, simnetParams)
 	opTrueP2SHPkScript, _ = txscript.PayToAddrScript(opTrueP2SHAddr)
+
+	testScriptFlags = txscript.ScriptDiscourageUpgradableNops |
+		txscript.ScriptVerifyCheckLockTimeVerify |
+		txscript.ScriptVerifyCheckSequenceVerify |
+		txscript.ScriptVerifyCleanStack |
+		txscript.ScriptVerifySigPushOnly |
+		txscript.ScriptVerifySHA256 |
+		txscript.ScriptVerifyTreasury
 )
 
 func debugTree(t *testing.T, tree *Tree) {
@@ -55,10 +65,10 @@ func debugTree(t *testing.T, tree *Tree) {
 	//t.Logf("fund tx: %s", spew.Sdump(tree.Tx))
 
 	print := func(n *Node) {
-		_, _, shortKey, _ := n.ScriptKeys()
+		lockedKey, _ := n.ScriptKeys()
 		prefix := strings.Repeat("    ", int(n.Level))
 		t.Logf("%s lvl %d (idx %d) - %s pk %x", prefix, n.Level,
-			n.Index, n.Amount, shortKey.SerializeCompressed())
+			n.Index, n.Amount, lockedKey.SerializeCompressed())
 		//t.Logf("tx: %s", spew.Sdump(n.Tx))
 	}
 
@@ -77,19 +87,57 @@ type redeemBranch int
 
 const (
 	redeemBranchImmediate redeemBranch = iota
-	redeemBranchShortLockTime
-	redeemBranchMediumLockTime
-	redeemBranchLongLockTime
+	redeemBranchLocked
 )
+
+func signFundTx(t *testing.T, tree *Tree) {
+	nbKeys := len(tree.Leafs)
+	privKeyInt := fundKeyInt * nbKeys
+	privKey := secp256k1.PrivKeyFromBytes([]byte{byte(privKeyInt)})
+	pubKey := privKey.PubKey()
+
+	prevPkScript := tree.PrefundTx.TxOut[0].PkScript
+	redeemScript, err := fundScript(pubKey, &tree.ChangeKey, tree.FundLockTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rawSig, err := txscript.RawTxInSignature(tree.Tx, 0, redeemScript,
+		txscript.SigHashAll, privKey.Serialize(),
+		dcrec.STSchnorrSecp256k1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bldr := txscript.NewScriptBuilder()
+	bldr.AddData(rawSig).AddData(pubKey.SerializeCompressed()).AddData(redeemScript)
+	sigScript, err := bldr.Script()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tree.Tx.TxIn[0].SignatureScript = sigScript
+
+	bknd := slog.NewBackend(os.Stdout)
+	logg := bknd.Logger("XXXX")
+	//logg.SetLevel(slog.LevelTrace)
+	txscript.UseLogger(logg)
+
+	// Now verify.
+	vm, err := txscript.NewEngine(prevPkScript, tree.Tx, 0, testScriptFlags, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = vm.Execute()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	// Determine how many copies of the test key are needed to sign at this
 	// level.
-	nbKeys := 1 << (node.Tree.Levels - node.Level - 1)
-	t.Logf("leaf count %d", node.LeafCount)
-	t.Logf("nb keys: %d", nbKeys)
-	nbKeys = node.LeafCount
-	//nbKeys := node.ChildrenCount + 1
+	nbKeys := node.LeafCount
 
 	// Test private keys are simple ints, so just figure out which redeem
 	// branch is being used and multiply by the nb of keys.
@@ -103,35 +151,21 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	)
 	switch redeemBranch {
 	case redeemBranchImmediate:
-		// providerKey + userSellKey
+		// userKey
 		privKeyInt = int(providerKeyInt+userSellKeyInt) * nbKeys
 		node.Tx.TxIn[0].Sequence = 0
 		node.Tx.TxOut = node.Tx.TxOut[:1]
 		node.Tx.TxOut[0].PkScript = dummyPkScript
 
-	case redeemBranchMediumLockTime:
-		// providerKey + userKey
-		privKeyInt = int(providerKeyInt+userKeyInt) * nbKeys
+	case redeemBranchLocked:
+		// userKey
+		privKeyInt = int(userKeyInt) * nbKeys
 
 		// When signing leaf nodes (which naturally only have a single output) fill in
 		// the dummy pkscript as output script.
 		if len(node.Tx.TxOut) == 1 {
 			node.Tx.TxOut[0].PkScript = dummyPkScript
 		}
-
-	case redeemBranchShortLockTime:
-		// providerSellKey + userKey
-		privKeyInt = (providerSellKeyInt + userKeyInt) * nbKeys
-		node.Tx.TxIn[0].Sequence = 0
-		node.Tx.TxOut = node.Tx.TxOut[:1]
-		node.Tx.TxOut[0].PkScript = dummyPkScript
-
-	case redeemBranchLongLockTime:
-		// providerKey
-		privKeyInt = int(providerKeyInt) * nbKeys
-		node.Tx.TxIn[0].Sequence = node.Tree.LongLockTime
-		node.Tx.TxOut = node.Tx.TxOut[:1]
-		node.Tx.TxOut[0].PkScript = dummyPkScript
 	}
 
 	prevPkScript := node.Tree.Tx.TxOut[0].PkScript
@@ -171,14 +205,7 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	t.Logf("XXXXX %x", redeemScript)
 
 	// Now verify.
-	scriptFlags := txscript.ScriptDiscourageUpgradableNops |
-		txscript.ScriptVerifyCheckLockTimeVerify |
-		txscript.ScriptVerifyCheckSequenceVerify |
-		txscript.ScriptVerifyCleanStack |
-		txscript.ScriptVerifySigPushOnly |
-		txscript.ScriptVerifySHA256 |
-		txscript.ScriptVerifyTreasury
-	vm, err := txscript.NewEngine(prevPkScript, node.Tx, 0, scriptFlags, 0, nil)
+	vm, err := txscript.NewEngine(prevPkScript, node.Tx, 0, testScriptFlags, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +232,7 @@ func TestNodeFees(t *testing.T) {
 }
 
 func TestBuildTree(t *testing.T) {
-	leafs := make([]ProposedLeaf, 9)
+	leafs := make([]ProposedLeaf, 8)
 
 	/*
 		for i := 0; i < 36; i++ {
@@ -224,13 +251,11 @@ func TestBuildTree(t *testing.T) {
 		}
 	}
 	proposal := &ProposedTree{
-		Inputs: []*wire.TxIn{
+		PrefundInputs: []*wire.TxIn{
 			{ValueIn: 100e8},
 		},
 		Leafs:           leafs,
-		LongLockTime:    100,
-		MediumLockTime:  10,
-		ShortLockTime:   1,
+		LockTime:        10,
 		InitialLockTime: 1000,
 	}
 
@@ -239,5 +264,5 @@ func TestBuildTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	debugTree(t, tree)
-	signSubtree(t, tree.Root, redeemBranchMediumLockTime)
+	signSubtree(t, tree.Root, redeemBranchLocked)
 }

@@ -5,6 +5,7 @@ import (
 
 	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
+	"github.com/decred/dcrd/dcrec/secp256k1/v3/schnorr"
 	"github.com/decred/dcrd/dcrutil/v3"
 	"github.com/decred/dcrd/txscript/v3"
 	"github.com/decred/dcrd/wire"
@@ -16,30 +17,17 @@ import (
 //     IF
 //       DROP
 //     ELSE
-//       DUP [short-key-hash] EQUAL
-//       IF
-//         DROP [short-csv]
-//       ELSE
-//         DUP [medium-key-hash] EQUAL
-//         IF
-//           DROP [medium-csv]
-//         ELSE
-//           DUP [long-key-hash] EQUALVERIFY
-//           [long-csv]
-//         ENDIF
-//       ENDIF
-//       CHECKSEQUENCEVERIFY DROP
+//       [locked-key-hash] EQUALVERIFY
+//       [locktime] CHECKSEQUENCEVERIFY DROP
 //     ENDIF
 //     [schnorr-sig-type] CHECKSIGALT
-func nodeScript(longKey, mediumKey, shortKey, immediateKey *secp256k1.PublicKey,
-	longLockTime, mediumLockTime, shortLockTime uint32) ([]byte, error) {
+func nodeScript(lockedKey, immediateKey *secp256k1.PublicKey,
+	lockTime uint32) ([]byte, error) {
 
 	var b txscript.ScriptBuilder
 
-	shortKeyHash := dcrutil.Hash160(shortKey.SerializeCompressed())
-	mediumKeyHash := dcrutil.Hash160(mediumKey.SerializeCompressed())
-	longKeyHash := dcrutil.Hash160(longKey.SerializeCompressed())
 	immediateKeyHash := dcrutil.Hash160(immediateKey.SerializeCompressed())
+	lockedKeyHash := dcrutil.Hash160(lockedKey.SerializeCompressed())
 
 	b.AddOp(txscript.OP_DUP)
 	b.AddOp(txscript.OP_HASH160)
@@ -51,31 +39,9 @@ func nodeScript(longKey, mediumKey, shortKey, immediateKey *secp256k1.PublicKey,
 	b.AddOp(txscript.OP_DROP)
 
 	b.AddOp(txscript.OP_ELSE)
-	b.AddOp(txscript.OP_DUP)
-	b.AddData(shortKeyHash)
-	b.AddOp(txscript.OP_EQUAL)
-
-	b.AddOp(txscript.OP_IF)
-	b.AddOp(txscript.OP_DROP)
-	b.AddInt64(int64(shortLockTime))
-
-	b.AddOp(txscript.OP_ELSE)
-	b.AddOp(txscript.OP_DUP)
-	b.AddData(mediumKeyHash)
-	b.AddOp(txscript.OP_EQUAL)
-
-	b.AddOp(txscript.OP_IF)
-	b.AddOp(txscript.OP_DROP)
-	b.AddInt64(int64(mediumLockTime))
-
-	b.AddOp(txscript.OP_ELSE)
-	b.AddOp(txscript.OP_DUP)
-	b.AddData(longKeyHash)
+	b.AddData(lockedKeyHash)
 	b.AddOp(txscript.OP_EQUALVERIFY)
-	b.AddInt64(int64(longLockTime))
-	b.AddOp(txscript.OP_ENDIF)
-	b.AddOp(txscript.OP_ENDIF)
-
+	b.AddInt64(int64(lockTime))
 	b.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
 	b.AddOp(txscript.OP_DROP)
 	b.AddOp(txscript.OP_ENDIF)
@@ -84,6 +50,65 @@ func nodeScript(longKey, mediumKey, shortKey, immediateKey *secp256k1.PublicKey,
 	b.AddOp(txscript.OP_CHECKSIGALT)
 
 	return b.Script()
+}
+
+// fundScript returns the script that binds the funding output in the prefund
+// transaction.
+//
+//     DUP HASH160 DUP [fund key hash] EQUAL
+//     IF
+//         DROP
+//     ELSE
+//        [change key hash] EQUALVERIFY
+//        [locktime] CHECKSEQUENCEVERIFY DROP
+//     ENDIF
+//     [schnorr sig type] CHECKSIGALT
+func fundScript(fundKey, changeKey *secp256k1.PublicKey, lockTime uint32) ([]byte, error) {
+	var b txscript.ScriptBuilder
+
+	fundKeyHash := dcrutil.Hash160(fundKey.SerializeCompressed())
+	changeKeyHash := dcrutil.Hash160(changeKey.SerializeCompressed())
+
+	b.AddOp(txscript.OP_DUP)
+	b.AddOp(txscript.OP_HASH160)
+	b.AddOp(txscript.OP_DUP)
+	b.AddData(fundKeyHash)
+	b.AddOp(txscript.OP_EQUAL)
+
+	b.AddOp(txscript.OP_IF)
+	b.AddOp(txscript.OP_DROP)
+
+	b.AddOp(txscript.OP_ELSE)
+	b.AddData(changeKeyHash)
+	b.AddInt64(int64(lockTime))
+	b.AddOp(txscript.OP_CHECKSEQUENCEVERIFY)
+	b.AddOp(txscript.OP_DROP)
+
+	b.AddOp(txscript.OP_ENDIF)
+
+	b.AddInt64(int64(dcrec.STSchnorrSecp256k1))
+	b.AddOp(txscript.OP_CHECKSIGALT)
+
+	return b.Script()
+}
+
+// sigAndScriptSigScript generates a signature script for fullfilling any sort
+// of script that consists only of <schnorr-sig> <public key> <redeem script>.
+func sigAndScriptSigScript(sig *schnorr.Signature, key *secp256k1.PublicKey, redeemScript []byte) ([]byte, error) {
+	var b txscript.ScriptBuilder
+	keyBytes := key.SerializeCompressed()
+	sigBytes := sig.Serialize()
+	sigBytes = append(sigBytes, byte(txscript.SigHashAll))
+	b.AddData(sigBytes).AddData(keyBytes).AddData(redeemScript)
+	return b.Script()
+}
+
+func nodeSigScript(sig *schnorr.Signature, key *secp256k1.PublicKey, redeemScript []byte) ([]byte, error) {
+	return sigAndScriptSigScript(sig, key, redeemScript)
+}
+
+func fundSigScript(sig *schnorr.Signature, key *secp256k1.PublicKey, redeemScript []byte) ([]byte, error) {
+	return sigAndScriptSigScript(sig, key, redeemScript)
 }
 
 func payToScriptHashScript(script []byte) []byte {
@@ -97,6 +122,20 @@ func payToScriptHashScript(script []byte) []byte {
 	return res
 }
 
+func payToPubKeyHashScript(pubkey *secp256k1.PublicKey) []byte {
+	serKey := pubkey.SerializeCompressed()
+	keyHash := dcrutil.Hash160(serKey)
+	res := []byte{
+		0:  txscript.OP_DUP,
+		1:  txscript.OP_HASH160,
+		2:  txscript.OP_DATA_20,
+		23: txscript.OP_EQUALVERIFY,
+		24: txscript.OP_CHECKSIG,
+	}
+	copy(res[3:23], keyHash)
+	return res
+}
+
 func calcNodeTxFee(feeRate dcrutil.Amount) int64 {
 	// Really crappy way to determine the fee, by creating a full tx.
 	//
@@ -105,8 +144,7 @@ func calcNodeTxFee(feeRate dcrutil.Amount) int64 {
 	var sig [65]byte
 	var pk [33]byte
 	maxLT := uint32(math.MaxUint32)
-	redeemScript, err := nodeScript(&zeroKey, &zeroKey, &zeroKey, &zeroKey,
-		maxLT, maxLT, maxLT)
+	redeemScript, err := nodeScript(&zeroKey, &zeroKey, maxLT)
 	if err != nil {
 		panic(err)
 	}
@@ -132,6 +170,10 @@ func calcNodeTxFee(feeRate dcrutil.Amount) int64 {
 	return fee
 }
 
+func CalcNodeTxFee(feeRate dcrutil.Amount) dcrutil.Amount {
+	return dcrutil.Amount(calcNodeTxFee(feeRate))
+}
+
 func calcLeafRedeemTxFee(feeRate dcrutil.Amount) int64 {
 	// Really crappy way to determine the fee, by creating a full tx.
 	//
@@ -140,8 +182,7 @@ func calcLeafRedeemTxFee(feeRate dcrutil.Amount) int64 {
 	var sig [65]byte
 	var pk [33]byte
 	maxLT := uint32(math.MaxUint32)
-	redeemScript, err := nodeScript(&zeroKey, &zeroKey, &zeroKey, &zeroKey,
-		maxLT, maxLT, maxLT)
+	redeemScript, err := nodeScript(&zeroKey, &zeroKey, maxLT)
 	if err != nil {
 		panic(err)
 	}
@@ -163,4 +204,20 @@ func calcLeafRedeemTxFee(feeRate dcrutil.Amount) int64 {
 	txSize := tx.SerializeSize()
 	fee := int64(txSize) * int64(feeRate) / 1000
 	return fee
+}
+
+func calcFundTxFee(feeRate dcrutil.Amount, nbAdditionalP2PKHIns int) int64 {
+	return 40000 // TODO: implement
+}
+
+func CalcFundTxFee(feeRate dcrutil.Amount, nbAdditionalP2PKHIns int) dcrutil.Amount {
+	return dcrutil.Amount(calcFundTxFee(feeRate, nbAdditionalP2PKHIns))
+}
+
+func calcPrefundTxFee(feeRate dcrutil.Amount, nbP2PKHIns int) int64 {
+	return 40000 // TODO: implement
+}
+
+func CalcPrefundTxFee(feeRate dcrutil.Amount, nbP2PKHIns int) dcrutil.Amount {
+	return dcrutil.Amount(calcPrefundTxFee(feeRate, nbP2PKHIns))
 }
