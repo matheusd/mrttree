@@ -75,7 +75,7 @@ type TestUser struct {
 func (u *TestUser) GenerateNonces(tree *Tree) {
 	u.t.Helper()
 
-	// Gather all leaf keys.
+	// Gather all our leaf keys.
 	leafKeys := make([]*secp256k1.PublicKey, len(u.Keys))
 	for i, k := range u.Keys {
 		var err error
@@ -139,13 +139,14 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 			return err
 		}
 
-		// Signing the locked version, so the group key is the locked
-		// one.
-		groupKey, _ := node.ScriptKeys()
-
-		// Figure out all leaf keys involved in this node and filter to
-		// leave only the user's keys.
+		// Generate the group key and musig group tweak L.
 		leafKeys := node.SubtreeUserLeafKeys()
+		groupKey, musigL, err := musigGroupKeyFromKeys(leafKeys...)
+		if err != nil {
+			return err
+		}
+
+		// Filter keys to leave only the ones owned by this user.
 		for i := 0; i < len(leafKeys); {
 			var k [33]byte
 			copy(k[:], leafKeys[i].SerializeCompressed())
@@ -177,7 +178,7 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 			copy(myPubKey[:], leafKeys[i].SerializeCompressed())
 			priv := u.KeysPrivs[myPubKey]
 
-			sig, err := partialSign(R, groupKey, invertedR, r, priv, sigHash)
+			sig, err := partialMuSigSign(R, invertedR, musigL, r, priv, sigHash)
 			if err != nil {
 				return err
 			}
@@ -186,8 +187,8 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 
 			fullS.Add(sig)
 
-			// Verify the aggregated key so far.
-			err = partialVerify(R, sigHash, u.TreeNonces[index][:i+1],
+			// Verify the aggregated sig so far.
+			err = partialMuSigVerify(R, musigL, sigHash, u.TreeNonces[index][:i+1],
 				leafKeys[:i+1], fullS)
 			if err != nil {
 				return fmt.Errorf("partial verify failed: %v", err)
@@ -209,7 +210,8 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 			fmt.Printf("XXXXX group key %x\n", groupKey.SerializeCompressed())
 		}
 
-		err = partialVerify(R, sigHash, u.TreeNonces[index],
+		// Verify the final user's partial aggregated signature.
+		err = partialMuSigVerify(R, musigL, sigHash, u.TreeNonces[index],
 			leafKeys, fullS)
 		if err != nil {
 			return fmt.Errorf("partial verify failed: %v", err)
@@ -234,7 +236,10 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 		return err
 	}
 
-	fundKey := u.tree.FundKey()
+	fundKey, fundMusigL, err := u.tree.FundKey()
+	if err != nil {
+		return err
+	}
 
 	// Create tuples of <fundKeyPriv, fundNoncePriv> to ease partial
 	// signing.
@@ -242,21 +247,25 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 		priv  *secp256k1.PrivateKey
 		nonce *secp256k1.PrivateKey
 	}, len(u.FundPrivs))
+	fundNonces := make([][]byte, len(u.FundPrivs))
+	fundPubs := make([]*secp256k1.PublicKey, len(u.FundPrivs))
 	i := 0
 	for _, key := range u.FundPrivs {
 		fundTuples[i].priv = key
+		fundPubs[i] = key.PubKey()
 		i += 1
 	}
 	i = 0
 	for _, nonce := range u.FundNoncesPrivs {
 		fundTuples[i].nonce = nonce
+		fundNonces[i] = nonce.PubKey().SerializeCompressed()
 		i += 1
 	}
 
 	fundSigs := make([][]byte, len(u.FundPrivs))
 	fundFullS := new(secp256k1.ModNScalar)
 	for i, tuple := range fundTuples {
-		sig, err := partialSign(R, fundKey, invertedR, tuple.nonce,
+		sig, err := partialMuSigSign(R, invertedR, fundMusigL, tuple.nonce,
 			tuple.priv, sigHash)
 		if err != nil {
 			return err
@@ -264,6 +273,13 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 		s := sig.Bytes()
 		fundSigs[i] = s[:]
 		fundFullS.Add(sig)
+	}
+
+	// Verify the final user's partial aggregated signature.
+	err = partialMuSigVerify(R, fundMusigL, sigHash, fundNonces,
+		fundPubs, fundFullS)
+	if err != nil {
+		return fmt.Errorf("partial verify of fund sig failed: %v", err)
 	}
 
 	// Double check it's valid (only works if we have all leaf keys)

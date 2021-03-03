@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 
+	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3/schnorr"
 	"github.com/decred/dcrd/dcrutil/v3"
@@ -34,12 +35,16 @@ type Node struct {
 
 // ScriptKeys returns the locked and immediate keys (respectively) for a given
 // MRTTREE node.
-func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey) {
+func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey, error) {
+	userKeys := n.SubtreeUserLeafKeys()
+	lockedKey, _, err := musigGroupKeyFromKeys(userKeys...)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	lockedKey := n.UserKey
 	immediateKey := addPubKeys(&n.ProviderKey, &n.UserSellableKey)
 
-	return &lockedKey, &immediateKey
+	return lockedKey, &immediateKey, nil
 }
 
 func (n *Node) RedeemScript() ([]byte, error) {
@@ -48,7 +53,10 @@ func (n *Node) RedeemScript() ([]byte, error) {
 		lockTime += n.Tree.InitialLockTime
 	}
 
-	lockedKey, immediateKey := n.ScriptKeys()
+	lockedKey, immediateKey, err := n.ScriptKeys()
+	if err != nil {
+		return nil, err
+	}
 	redeemScript, err := nodeScript(lockedKey, immediateKey, lockTime)
 	if err != nil {
 		return nil, err
@@ -69,7 +77,10 @@ func (n *Node) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k1.M
 	var R secp256k1.JacobianPoint
 	RPub.AsJacobian(&R)
 	sig := schnorr.NewSignature(&R.X, s)
-	pub, _ := n.ScriptKeys()
+	pub, _, err := n.ScriptKeys()
+	if err != nil {
+		return err
+	}
 	redeemScript, err := n.RedeemScript()
 	if err != nil {
 		return err
@@ -87,8 +98,8 @@ func (n *Node) SubtreeUserLeafKeys() []*secp256k1.PublicKey {
 		if p.Leaf {
 			keys = append(keys, &p.UserKey)
 		} else {
-			stack.push(p.Children[0])
 			stack.push(p.Children[1])
+			stack.push(p.Children[0])
 		}
 	}
 	return keys
@@ -185,19 +196,22 @@ type Tree struct {
 }
 
 // FundKey returns the group key used to spend the prefund output in the fund
-// tx.
-func (tree *Tree) FundKey() *secp256k1.PublicKey {
-	fundKey := tree.Leafs[0].FundKey
-	for i := 1; i < len(tree.Leafs); i++ {
-		fundKey = addPubKeys(&fundKey, &tree.Leafs[i].FundKey)
+// tx and the musig group tweak used to generate that key.
+func (tree *Tree) FundKey() (*secp256k1.PublicKey, *chainhash.Hash, error) {
+	keys := make([]*secp256k1.PublicKey, len(tree.Leafs))
+	for i := 0; i < len(tree.Leafs); i++ {
+		keys[i] = &tree.Leafs[i].FundKey
 	}
-	return &fundKey
+	return musigGroupKeyFromKeys(keys...)
 }
 
 // FundScript returns the redeemScript of the prefund tx output, spent in the
 // fund tx.
 func (tree *Tree) FundScript() ([]byte, error) {
-	fundKey := tree.FundKey()
+	fundKey, _, err := tree.FundKey()
+	if err != nil {
+		return nil, err
+	}
 	return fundScript(fundKey, &tree.ChangeKey, tree.FundLockTime)
 }
 
@@ -226,7 +240,10 @@ func (tree *Tree) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k
 	var R secp256k1.JacobianPoint
 	RPub.AsJacobian(&R)
 	sig := schnorr.NewSignature(&R.X, s)
-	pub := tree.FundKey()
+	pub, _, err := tree.FundKey()
+	if err != nil {
+		return err
+	}
 	redeemScript, err := tree.FundScript()
 	if err != nil {
 		return err

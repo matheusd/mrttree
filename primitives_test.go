@@ -15,7 +15,7 @@ func assertNoError(t *testing.T, err error) {
 	}
 }
 
-func TestPartialSign(t *testing.T) {
+func TestPartialMusigSign(t *testing.T) {
 	rnd := rand.New(rand.NewSource(0x22345670))
 
 	msg := make([]byte, 32)
@@ -23,22 +23,25 @@ func TestPartialSign(t *testing.T) {
 
 	nbKeys := 8
 	keys := make([]*secp256k1.PrivateKey, nbKeys)
+	pubKeys := make([]*secp256k1.PublicKey, nbKeys)
 	nonces := make([]*secp256k1.PrivateKey, nbKeys)
 	nonceBytes := make([][]byte, nbKeys)
-	var groupKey secp256k1.PublicKey
 	for i := 0; i < nbKeys; i++ {
 		keys[i] = randKey(rnd)
+		pubKeys[i] = keys[i].PubKey()
 		nonces[i] = randKey(rnd)
-		groupKey = addPubKeys(&groupKey, keys[i].PubKey())
 		nonceBytes[i] = nonces[i].PubKey().SerializeCompressed()
 	}
+
+	groupKey, musigL, err := musigGroupKeyFromKeys(pubKeys...)
+	assertNoError(t, err)
 
 	RPub, inverted, err := produceR(nonceBytes)
 	assertNoError(t, err)
 
 	fullS := new(secp256k1.ModNScalar)
 	for i := 0; i < nbKeys; i++ {
-		s, err := partialSign(RPub, &groupKey, inverted, nonces[i],
+		s, err := partialMuSigSign(RPub, inverted, musigL, nonces[i],
 			keys[i], msg)
 		assertNoError(t, err)
 		fullS.Add(s)
@@ -48,7 +51,7 @@ func TestPartialSign(t *testing.T) {
 	RPub.AsJacobian(&R)
 	sig := schnorr.NewSignature(&R.X, fullS)
 
-	if !sig.Verify(msg, &groupKey) {
+	if !sig.Verify(msg, groupKey) {
 		t.Fatal("signature did not verify")
 	}
 }

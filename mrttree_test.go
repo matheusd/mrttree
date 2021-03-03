@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrutil/v3"
@@ -65,7 +67,10 @@ func debugTree(t *testing.T, tree *Tree) {
 	//t.Logf("fund tx: %s", spew.Sdump(tree.Tx))
 
 	print := func(n *Node) {
-		lockedKey, _ := n.ScriptKeys()
+		lockedKey, _, err := n.ScriptKeys()
+		if err != nil {
+			t.Fatal(err)
+		}
 		prefix := strings.Repeat("    ", int(n.Level))
 		t.Logf("%s lvl %d (idx %d) - %s pk %x", prefix, n.Level,
 			n.Index, n.Amount, lockedKey.SerializeCompressed())
@@ -90,10 +95,50 @@ const (
 	redeemBranchLocked
 )
 
+func genGroupMuSigPrivKey(nb int, keys ...byte) *secp256k1.PrivateKey {
+	// Generate the individual pub keys.
+	pubKeys := make([]*secp256k1.PublicKey, len(keys))
+	pubSerKeys := make([][]byte, len(keys))
+	for i, key := range keys {
+		privKey := secp256k1.PrivKeyFromBytes([]byte{byte(key)})
+		pubKeys[i] = privKey.PubKey()
+		pubSerKeys[i] = pubKeys[i].SerializeCompressed()
+	}
+
+	// Generate L.
+	hasher := blake256.New()
+	for i := 0; i < nb; i++ {
+		for _, key := range pubSerKeys {
+			hasher.Write(key)
+		}
+	}
+	var L chainhash.Hash
+	copy(L[:], hasher.Sum(nil))
+
+	// Accumulate the group key.
+	var tweakModN, groupPriv secp256k1.ModNScalar
+	var buff [32 + 33]byte
+	copy(buff[:32], L[:])
+
+	for i := 0; i < nb; i++ {
+		for j := 0; j < len(keys); j++ {
+			copy(buff[32:], pubSerKeys[j])
+			tweak := blake256.Sum256(buff[:])
+
+			// TODO: bounds check tweak (== 0, >= q)
+			tweakModN.SetBytes(&tweak)
+
+			var priv secp256k1.ModNScalar
+			groupPriv.Add(priv.SetInt(uint32(keys[j])).Mul(&tweakModN))
+		}
+	}
+
+	return secp256k1.NewPrivateKey(&groupPriv)
+}
+
 func signFundTx(t *testing.T, tree *Tree) {
 	nbKeys := len(tree.Leafs)
-	privKeyInt := fundKeyInt * nbKeys
-	privKey := secp256k1.PrivKeyFromBytes([]byte{byte(privKeyInt)})
+	privKey := genGroupMuSigPrivKey(nbKeys, fundKeyInt)
 	pubKey := privKey.PubKey()
 
 	prevPkScript := tree.PrefundTx.TxOut[0].PkScript
@@ -147,19 +192,19 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	// the non-default branches, either by waiting for the LongTimelock or
 	// by having purchased all UserSellableKeys.
 	var (
-		privKeyInt int
+		keys []byte
 	)
 	switch redeemBranch {
 	case redeemBranchImmediate:
 		// userKey
-		privKeyInt = int(providerKeyInt+userSellKeyInt) * nbKeys
+		keys = []byte{providerKeyInt, userSellKeyInt}
 		node.Tx.TxIn[0].Sequence = 0
 		node.Tx.TxOut = node.Tx.TxOut[:1]
 		node.Tx.TxOut[0].PkScript = dummyPkScript
 
 	case redeemBranchLocked:
 		// userKey
-		privKeyInt = int(userKeyInt) * nbKeys
+		keys = []byte{userKeyInt}
 
 		// When signing leaf nodes (which naturally only have a single output) fill in
 		// the dummy pkscript as output script.
@@ -178,7 +223,7 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 		t.Fatal(err)
 	}
 
-	privKey := secp256k1.PrivKeyFromBytes([]byte{byte(privKeyInt)})
+	privKey := genGroupMuSigPrivKey(nbKeys, keys...)
 	pubKeyData := privKey.PubKey().SerializeCompressed()
 
 	rawSig, err := txscript.RawTxInSignature(node.Tx, 0, redeemScript,
