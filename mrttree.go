@@ -8,7 +8,22 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3/schnorr"
 	"github.com/decred/dcrd/dcrutil/v3"
+	"github.com/decred/dcrd/txscript/v3"
 	"github.com/decred/dcrd/wire"
+)
+
+const (
+	HasherTagLockedKey    = "mrttreeLockedKey"
+	HasherTagImmediateKey = "mrttreeImmediateKey"
+	HasherTagFundKey      = "mrttreeFundKey"
+
+	VerifyScriptFlags = txscript.ScriptDiscourageUpgradableNops |
+		txscript.ScriptVerifyCheckLockTimeVerify |
+		txscript.ScriptVerifyCheckSequenceVerify |
+		txscript.ScriptVerifyCleanStack |
+		txscript.ScriptVerifySigPushOnly |
+		txscript.ScriptVerifySHA256 |
+		txscript.ScriptVerifyTreasury
 )
 
 type Node struct {
@@ -36,15 +51,19 @@ type Node struct {
 // ScriptKeys returns the locked and immediate keys (respectively) for a given
 // MRTTREE node.
 func (n *Node) ScriptKeys() (*secp256k1.PublicKey, *secp256k1.PublicKey, error) {
-	userKeys := n.SubtreeUserLeafKeys()
-	lockedKey, _, err := musigGroupKeyFromKeys(userKeys...)
+	keys := n.SubtreeLeafKeys()
+
+	lockedKey, _, err := musigGroupKeyFromKeys(HasherTagLockedKey, keys...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	immediateKey := addPubKeys(&n.ProviderKey, &n.UserSellableKey)
+	immKey, _, err := musigGroupKeyFromKeys(HasherTagImmediateKey, keys...)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	return lockedKey, &immediateKey, nil
+	return lockedKey, immKey, nil
 }
 
 func (n *Node) RedeemScript() ([]byte, error) {
@@ -88,6 +107,24 @@ func (n *Node) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k1.M
 
 	n.Tx.TxIn[0].SignatureScript, err = nodeSigScript(sig, pub, redeemScript)
 	return err
+}
+
+func (n *Node) SubtreeLeafKeys() []*secp256k1.PublicKey {
+	stack := nodeStack{n}
+	nbLeafKeysHint := 1 << (n.Tree.Levels - n.Level - 1)
+	userKeys := make([]*secp256k1.PublicKey, 0, nbLeafKeysHint*2)
+	provKeys := make([]*secp256k1.PublicKey, 0, nbLeafKeysHint)
+	for len(stack) > 0 {
+		p := stack.pop()
+		if p.Leaf {
+			userKeys = append(userKeys, &p.UserKey)
+			provKeys = append(provKeys, &p.ProviderKey)
+		} else {
+			stack.push(p.Children[1])
+			stack.push(p.Children[0])
+		}
+	}
+	return append(userKeys, provKeys...)
 }
 
 func (n *Node) SubtreeUserLeafKeys() []*secp256k1.PublicKey {
@@ -198,11 +235,8 @@ type Tree struct {
 // FundKey returns the group key used to spend the prefund output in the fund
 // tx and the musig group tweak used to generate that key.
 func (tree *Tree) FundKey() (*secp256k1.PublicKey, *chainhash.Hash, error) {
-	keys := make([]*secp256k1.PublicKey, len(tree.Leafs))
-	for i := 0; i < len(tree.Leafs); i++ {
-		keys[i] = &tree.Leafs[i].FundKey
-	}
-	return musigGroupKeyFromKeys(keys...)
+	keys := tree.Root.SubtreeLeafKeys()
+	return musigGroupKeyFromKeys(HasherTagFundKey, keys...)
 }
 
 // FundScript returns the redeemScript of the prefund tx output, spent in the
@@ -228,10 +262,12 @@ func (tree *Tree) FundP2SH() ([]byte, error) {
 // they are involved in. The same pubkey might be involved in multiple leafs in
 // case it is repetead.
 func (tree *Tree) BuildLeafPubKeyMap() LeafPubKeyMap {
-	res := make(LeafPubKeyMap, len(tree.Leafs))
+	res := make(LeafPubKeyMap, len(tree.Leafs)*2)
 	for _, leaf := range tree.Leafs {
 		nodes := res[leaf.UserKey]
 		res[leaf.UserKey] = append(nodes, leaf)
+		nodes = res[leaf.ProviderKey]
+		res[leaf.ProviderKey] = append(nodes, leaf)
 	}
 	return res
 }
@@ -251,6 +287,84 @@ func (tree *Tree) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k
 
 	tree.Tx.TxIn[0].SignatureScript, err = fundSigScript(sig, pub, redeemScript)
 	return err
+}
+
+func (tree *Tree) FillTxSignatures(treeNonces map[uint32][][]byte, treeSigs map[uint32][]byte,
+	fundNonces [][]byte, fundSig []byte) error {
+
+	stack := makeNodeStack(int(tree.Levels + 1))
+	stack.push(tree.Root)
+	for stack.len() > 0 {
+		node := stack.pop()
+		if node.Leaf {
+			continue
+		}
+		stack.push(node.Children[1])
+		stack.push(node.Children[0])
+
+		var s secp256k1.ModNScalar
+		s.SetByteSlice(treeSigs[node.Index])
+
+		R, err := ProduceR(treeNonces[node.Index])
+		if err != nil {
+			return err
+		}
+
+		if err := node.AssembleLockedSigScript(R, &s); err != nil {
+			return err
+		}
+	}
+
+	var s secp256k1.ModNScalar
+	s.SetByteSlice(fundSig)
+
+	R, err := ProduceR(fundNonces)
+	if err != nil {
+		return err
+	}
+
+	if err := tree.AssembleLockedSigScript(R, &s); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (tree *Tree) VerifyTxSignatures() error {
+	stack := makeNodeStack(int(tree.Levels + 1))
+	stack.push(tree.Root)
+	for stack.len() > 0 {
+		node := stack.pop()
+		if node.Leaf {
+			continue
+		}
+		stack.push(node.Children[1])
+		stack.push(node.Children[0])
+
+		vm, err := txscript.NewEngine(node.PrevOutput.PkScript, node.Tx, 0,
+			VerifyScriptFlags, node.PrevOutput.Version, nil)
+		if err != nil {
+			return err
+		}
+		err = vm.Execute()
+		if err != nil {
+			return fmt.Errorf("error verifying node %d sig: %v",
+				node.Index, err)
+		}
+	}
+
+	prevOut := tree.PrefundTx.TxOut[0]
+	vm, err := txscript.NewEngine(prevOut.PkScript, tree.Tx, 0,
+		VerifyScriptFlags, prevOut.Version, nil)
+	if err != nil {
+		return err
+	}
+	err = vm.Execute()
+	if err != nil {
+		return fmt.Errorf("error verifying fund tx sig: %v", err)
+	}
+
+	return nil
 }
 
 type ProposedLeaf struct {

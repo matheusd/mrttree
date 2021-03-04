@@ -20,6 +20,7 @@ func TestPartialMusigSign(t *testing.T) {
 
 	msg := make([]byte, 32)
 	rnd.Read(msg)
+	tag := "testTag"
 
 	nbKeys := 8
 	keys := make([]*secp256k1.PrivateKey, nbKeys)
@@ -33,7 +34,7 @@ func TestPartialMusigSign(t *testing.T) {
 		nonceBytes[i] = nonces[i].PubKey().SerializeCompressed()
 	}
 
-	groupKey, musigL, err := musigGroupKeyFromKeys(pubKeys...)
+	groupKey, musigL, err := musigGroupKeyFromKeys(tag, pubKeys...)
 	assertNoError(t, err)
 
 	RPub, inverted, err := produceR(nonceBytes)

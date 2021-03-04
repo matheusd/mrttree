@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"decred.org/mrttree"
+	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrutil/v3"
 	"github.com/decred/dcrd/wire"
@@ -70,6 +71,13 @@ type session struct {
 
 	nbFilledSigs int
 	gotAllSigs   chan struct{}
+
+	providerTreeNonceHashes map[uint32][][]byte
+	providerTreeNonces      map[uint32][][]byte
+	providerFundNonceHashes [][]byte
+	providerFundNonces      [][]byte
+	providerTreeSigs        map[uint32][][]byte
+	providerFundSigs        [][]byte
 
 	allUserPkHashes     [][]byte
 	allSellPkHashes     [][]byte
@@ -239,10 +247,28 @@ func (sess *session) createTree() error {
 	return err
 }
 
+func (sess *session) calcProviderNonceHashes() {
+	sess.providerTreeNonceHashes = make(map[uint32][][]byte, len(sess.providerTreeNonces))
+
+	for i, nonces := range sess.providerTreeNonces {
+		hashes := make([][]byte, len(nonces))
+		for j, nonce := range nonces {
+			hashes[j] = chainhash.HashB(nonce)
+		}
+		sess.providerTreeNonceHashes[i] = hashes
+	}
+
+	fundHashes := make([][]byte, len(sess.providerFundNonces))
+	for i, nonce := range sess.providerFundNonces {
+		fundHashes[i] = chainhash.HashB(nonce)
+	}
+	sess.providerFundNonceHashes = fundHashes
+}
+
 func (sess *session) nonceHashesFilled() {
 	nbTxs := mrttree.CalcTreeTxs(sess.nbLeafs)
 	allTreeNonceHashes := make(map[uint32][][]byte, nbTxs)
-	allFundNonceHashes := make([][]byte, 0, sess.nbLeafs)
+	allFundNonceHashes := make([][]byte, 0, sess.nbLeafs*2)
 
 	for _, us := range sess.userSessions {
 		for index, hashes := range us.treeNonceHashes {
@@ -250,6 +276,12 @@ func (sess *session) nonceHashesFilled() {
 		}
 		allFundNonceHashes = append(allFundNonceHashes, us.fundNonceHashes...)
 	}
+
+	// Fill in the provider nonces.
+	for index, hashes := range sess.providerTreeNonceHashes {
+		allTreeNonceHashes[index] = append(allTreeNonceHashes[index], hashes...)
+	}
+	allFundNonceHashes = append(allFundNonceHashes, sess.providerFundNonceHashes...)
 
 	sess.allTreeNonceHashes = allTreeNonceHashes
 	sess.allFundNonceHashes = allFundNonceHashes
@@ -265,17 +297,42 @@ func (sess *session) noncesFilled() {
 		}
 		allFundNonces = append(allFundNonces, us.fundNonces...)
 	}
+
+	// Fill in the provider nonces.
+	for index, hashes := range sess.providerTreeNonces {
+		allTreeNonces[index] = append(allTreeNonces[index], hashes...)
+	}
+	allFundNonces = append(allFundNonces, sess.providerFundNonces...)
+
 	// TODO: shuffle entries since order doesn't matter.
 	sess.allTreeNonces = allTreeNonces
 	sess.allFundNonces = allFundNonces
 }
 
-func (sess *session) signaturesFilled() {
+func (sess *session) signaturesFilled() error {
 	nbTxs := mrttree.CalcTreeTxs(sess.nbLeafs)
 	allTreeSigs := make(map[uint32][]byte, nbTxs)
 
 	treeSigs := make(map[uint32]*secp256k1.ModNScalar, nbTxs)
 	var fundSig secp256k1.ModNScalar
+
+	for index, sigs := range sess.providerTreeSigs {
+		nsig := new(secp256k1.ModNScalar)
+		nsig.SetByteSlice(sigs[0])
+		treeSigs[index] = nsig
+
+		var sig secp256k1.ModNScalar
+		for _, sigBytes := range sigs[1:] {
+			sig.SetByteSlice(sigBytes)
+			treeSigs[index].Add(&sig)
+		}
+	}
+
+	for _, sigBytes := range sess.providerFundSigs {
+		var sig secp256k1.ModNScalar
+		sig.SetByteSlice(sigBytes)
+		fundSig.Add(&sig)
+	}
 
 	// Sum up the individual partial sigs.
 	for _, us := range sess.userSessions {
@@ -291,7 +348,6 @@ func (sess *session) signaturesFilled() {
 					treeSigs[index].Add(&sig)
 				}
 			}
-
 		}
 		for _, sigBytes := range us.fundSigs {
 			var sig secp256k1.ModNScalar
@@ -309,6 +365,16 @@ func (sess *session) signaturesFilled() {
 
 	sess.allTreeSigs = allTreeSigs
 	sess.fundSig = fundSigBytes[:]
+
+	// Finally, fill the signatureScript in the tree transactions.
+	err := sess.tree.FillTxSignatures(sess.allTreeNonces, sess.allTreeSigs,
+		sess.allFundNonces, sess.fundSig)
+	if err != nil {
+		return nil
+	}
+
+	// And verify the signatures are correct.
+	return sess.tree.VerifyTxSignatures()
 }
 
 type waitingSession struct {

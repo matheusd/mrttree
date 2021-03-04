@@ -8,7 +8,6 @@ import (
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
-	"github.com/decred/dcrd/dcrec/secp256k1/v3/schnorr"
 	"github.com/decred/dcrd/txscript/v3"
 )
 
@@ -72,7 +71,7 @@ type TestUser struct {
 	FundSigs [][]byte
 }
 
-func (u *TestUser) GenerateNonces(tree *Tree) {
+func (u *TestUser) GenerateNonces(tree *Tree) error {
 	u.t.Helper()
 
 	// Gather all our leaf keys.
@@ -81,7 +80,7 @@ func (u *TestUser) GenerateNonces(tree *Tree) {
 		var err error
 		leafKeys[i], err = secp256k1.ParsePubKey(k)
 		if err != nil {
-			u.t.Fatal(err)
+			return err
 		}
 	}
 
@@ -90,7 +89,7 @@ func (u *TestUser) GenerateNonces(tree *Tree) {
 	leafToNodes := tree.BuildLeafPubKeyMap()
 	u.NodeIndices, err = leafToNodes.AncestorBranchesCount(leafKeys)
 	if err != nil {
-		u.t.Fatal(err)
+		return err
 	}
 
 	// Generate the correct number of nonces for each node.
@@ -113,6 +112,8 @@ func (u *TestUser) GenerateNonces(tree *Tree) {
 	u.TreeNoncesPrivs = noncesPrivs
 	u.TreeNonces = nonces
 	u.TreeNoncesHashes = noncesHashes
+
+	return nil
 }
 
 func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byte) error {
@@ -140,8 +141,8 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 		}
 
 		// Generate the group key and musig group tweak L.
-		leafKeys := node.SubtreeUserLeafKeys()
-		groupKey, musigL, err := musigGroupKeyFromKeys(leafKeys...)
+		leafKeys := node.SubtreeLeafKeys()
+		_, musigL, err := musigGroupKeyFromKeys(HasherTagLockedKey, leafKeys...)
 		if err != nil {
 			return err
 		}
@@ -195,21 +196,6 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 			}
 		}
 
-		// Double check it's valid (only works if we have all leaf
-		// keys)
-		Rj := new(secp256k1.JacobianPoint)
-		R.AsJacobian(Rj)
-		sig := schnorr.NewSignature(&(Rj.X), fullS)
-		if !sig.Verify(sigHash, groupKey) {
-			return fmt.Errorf("full sig failed to validate")
-		} else {
-			fmt.Printf("XXXXX txh %s\n", tx.TxHash())
-			fmt.Printf("XXXXX validated full sig msg %x\n", sigHash)
-			fmt.Printf("XXXXX nbSigs %d s %x R %x\n", nbSigs, fullS.Bytes(),
-				R.SerializeCompressed())
-			fmt.Printf("XXXXX group key %x\n", groupKey.SerializeCompressed())
-		}
-
 		// Verify the final user's partial aggregated signature.
 		err = partialMuSigVerify(R, musigL, sigHash, u.TreeNonces[index],
 			leafKeys, fullS)
@@ -236,7 +222,7 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 		return err
 	}
 
-	fundKey, fundMusigL, err := u.tree.FundKey()
+	_, fundMusigL, err := u.tree.FundKey()
 	if err != nil {
 		return err
 	}
@@ -250,7 +236,7 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 	fundNonces := make([][]byte, len(u.FundPrivs))
 	fundPubs := make([]*secp256k1.PublicKey, len(u.FundPrivs))
 	i := 0
-	for _, key := range u.FundPrivs {
+	for _, key := range u.KeysPrivs {
 		fundTuples[i].priv = key
 		fundPubs[i] = key.PubKey()
 		i += 1
@@ -280,19 +266,6 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 		fundPubs, fundFullS)
 	if err != nil {
 		return fmt.Errorf("partial verify of fund sig failed: %v", err)
-	}
-
-	// Double check it's valid (only works if we have all leaf keys)
-	Rj := new(secp256k1.JacobianPoint)
-	R.AsJacobian(Rj)
-	sig := schnorr.NewSignature(&(Rj.X), fundFullS)
-	if !sig.Verify(sigHash, fundKey) {
-		return fmt.Errorf("full fund sig failed to validate")
-	} else {
-		fmt.Printf("YYYY txh %s\n", tx.TxHash())
-		fmt.Printf("YYYY validated full sig msg %x\n", sigHash)
-		fmt.Printf("YYYY s %x R %x\n", fundFullS.Bytes(),
-			R.SerializeCompressed())
 	}
 
 	u.TreeSigs = sigs

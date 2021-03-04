@@ -17,6 +17,9 @@ import (
 
 type Config struct {
 	ChangeKeySourcer func(ctx context.Context) (*secp256k1.PublicKey, error)
+	TreeKeySourcer   func(ctx context.Context, nbLeafs int) ([]*secp256k1.PublicKey, error)
+	TreeNoncer       func(ctx context.Context, tree *mrttree.Tree) (map[uint32][][]byte, [][]byte, error)
+	TreeSigner       func(ctx context.Context, tree *mrttree.Tree, allNonces map[uint32][][]byte, allFundNonces [][]byte) (map[uint32][][]byte, [][]byte, error)
 	InputSourcer     func(ctx context.Context, amount dcrutil.Amount) ([]*wire.TxIn, error)
 	InputReleaser    func(ctx context.Context, inputs []*wire.TxIn) error
 	TxFeeRate        dcrutil.Amount
@@ -45,11 +48,11 @@ type Server struct {
 
 var _ api.MrttreeServer = (*Server)(nil)
 
-func (s *Server) newSession(nbLeafs int, leafAmount dcrutil.Amount, lockTime, initialLockTime uint32, providerKeys []*secp256k1.PublicKey) (*session, sessionID, error) {
-	if len(providerKeys) != nbLeafs {
-		return nil, sessionID{}, fmt.Errorf("len(providerKeys) must be equal to nbLeafs")
+func (s *Server) newSession(nbLeafs int, leafAmount dcrutil.Amount, lockTime, initialLockTime uint32) (*session, sessionID, error) {
+	providerKeys, err := s.cfg.TreeKeySourcer(s.ctx, nbLeafs)
+	if err != nil {
+		return nil, sessionID{}, err
 	}
-
 	providerPks := make([][]byte, nbLeafs)
 	providerPkHashes := make([][]byte, nbLeafs)
 	providerIvs := make([][]byte, nbLeafs)
@@ -360,9 +363,19 @@ func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequ
 	gotAllKeys := sess.gotAllKeys
 	if sess.nbFilledKeys == sess.nbLeafs {
 		sess.keysFilled()
-		if err := sess.createTree(); err != nil {
+		var err error
+		if err = sess.createTree(); err != nil {
 			s.failSession(sess, fmt.Errorf("unable to create tree: %v", err))
 		} else {
+			sess.providerTreeNonces, sess.providerFundNonces, err =
+				s.cfg.TreeNoncer(ctx, sess.tree)
+			if err != nil {
+				s.failSession(sess, fmt.Errorf("unable to generate nonces: %v", err))
+			}
+		}
+
+		if err == nil {
+			sess.calcProviderNonceHashes()
 			close(gotAllKeys)
 		}
 	}
@@ -585,8 +598,19 @@ func (s *Server) SignedTree(ctx context.Context, req *api.SignedTreeRequest) (*a
 	sess.nbFilledSigs += 1
 	gotAllSigs := sess.gotAllSigs
 	if sess.nbFilledSigs == len(sess.userSessions) {
-		sess.signaturesFilled()
-		close(gotAllSigs)
+		// All user signatures received, provider will sign.
+		var err error
+		sess.providerTreeSigs, sess.providerFundSigs, err = s.cfg.TreeSigner(ctx, sess.tree, sess.allTreeNonces, sess.allFundNonces)
+		if err != nil {
+			s.failSession(sess, fmt.Errorf("unable to sign tree: %v", err))
+		} else {
+			if err := sess.signaturesFilled(); err != nil {
+				s.failSession(sess, fmt.Errorf("unable to fill tree sigs: %v", err))
+			} else {
+
+				close(gotAllSigs)
+			}
+		}
 	}
 	sessFailed := sess.failed
 	sess.Unlock()

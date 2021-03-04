@@ -8,7 +8,6 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
-	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrutil/v3"
@@ -42,13 +41,7 @@ var (
 	opTrueP2SHAddr, _     = dcrutil.NewAddressScriptHash(opTrueScript, simnetParams)
 	opTrueP2SHPkScript, _ = txscript.PayToAddrScript(opTrueP2SHAddr)
 
-	testScriptFlags = txscript.ScriptDiscourageUpgradableNops |
-		txscript.ScriptVerifyCheckLockTimeVerify |
-		txscript.ScriptVerifyCheckSequenceVerify |
-		txscript.ScriptVerifyCleanStack |
-		txscript.ScriptVerifySigPushOnly |
-		txscript.ScriptVerifySHA256 |
-		txscript.ScriptVerifyTreasury
+	testScriptFlags = VerifyScriptFlags
 )
 
 func debugTree(t *testing.T, tree *Tree) {
@@ -95,7 +88,7 @@ const (
 	redeemBranchLocked
 )
 
-func genGroupMuSigPrivKey(nb int, keys ...byte) *secp256k1.PrivateKey {
+func genGroupMuSigPrivKey(tag string, nb int, keys ...byte) *secp256k1.PrivateKey {
 	// Generate the individual pub keys.
 	pubKeys := make([]*secp256k1.PublicKey, len(keys))
 	pubSerKeys := make([][]byte, len(keys))
@@ -106,9 +99,9 @@ func genGroupMuSigPrivKey(nb int, keys ...byte) *secp256k1.PrivateKey {
 	}
 
 	// Generate L.
-	hasher := blake256.New()
-	for i := 0; i < nb; i++ {
-		for _, key := range pubSerKeys {
+	hasher := taggedHasher(tag)
+	for _, key := range pubSerKeys {
+		for i := 0; i < nb; i++ {
 			hasher.Write(key)
 		}
 	}
@@ -116,17 +109,14 @@ func genGroupMuSigPrivKey(nb int, keys ...byte) *secp256k1.PrivateKey {
 	copy(L[:], hasher.Sum(nil))
 
 	// Accumulate the group key.
-	var tweakModN, groupPriv secp256k1.ModNScalar
-	var buff [32 + 33]byte
-	copy(buff[:32], L[:])
+	var groupPriv secp256k1.ModNScalar
 
-	for i := 0; i < nb; i++ {
-		for j := 0; j < len(keys); j++ {
-			copy(buff[32:], pubSerKeys[j])
-			tweak := blake256.Sum256(buff[:])
-
-			// TODO: bounds check tweak (== 0, >= q)
-			tweakModN.SetBytes(&tweak)
+	for j := 0; j < len(keys); j++ {
+		for i := 0; i < nb; i++ {
+			tweakModN, err := musigKeyTweak(&L, pubSerKeys[j])
+			if err != nil {
+				panic(err)
+			}
 
 			var priv secp256k1.ModNScalar
 			groupPriv.Add(priv.SetInt(uint32(keys[j])).Mul(&tweakModN))
@@ -138,7 +128,8 @@ func genGroupMuSigPrivKey(nb int, keys ...byte) *secp256k1.PrivateKey {
 
 func signFundTx(t *testing.T, tree *Tree) {
 	nbKeys := len(tree.Leafs)
-	privKey := genGroupMuSigPrivKey(nbKeys, fundKeyInt)
+	keys := []byte{userKeyInt, providerKeyInt}
+	privKey := genGroupMuSigPrivKey(HasherTagFundKey, nbKeys, keys...)
 	pubKey := privKey.PubKey()
 
 	prevPkScript := tree.PrefundTx.TxOut[0].PkScript
@@ -184,27 +175,28 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 	// level.
 	nbKeys := node.LeafCount
 
-	// Test private keys are simple ints, so just figure out which redeem
-	// branch is being used and multiply by the nb of keys.
+	// The group key for each redeem branch is always the set of leaf user
+	// keys then the set of leaf provider keys.
+	keys := []byte{userKeyInt, providerKeyInt}
+
+	// Figure out which tag to use to generate the private key, depending
+	// on which redeeming alternative is being used.
 	//
 	// Additionally, if signing a non-default branch, adjust the outputs
 	// and sequence. Recall that only the provider can unilaterally sign
 	// the non-default branches, either by waiting for the LongTimelock or
 	// by having purchased all UserSellableKeys.
-	var (
-		keys []byte
-	)
+	var tag string
 	switch redeemBranch {
 	case redeemBranchImmediate:
-		// userKey
-		keys = []byte{providerKeyInt, userSellKeyInt}
+		tag = HasherTagImmediateKey
+
 		node.Tx.TxIn[0].Sequence = 0
 		node.Tx.TxOut = node.Tx.TxOut[:1]
 		node.Tx.TxOut[0].PkScript = dummyPkScript
 
 	case redeemBranchLocked:
-		// userKey
-		keys = []byte{userKeyInt}
+		tag = HasherTagLockedKey
 
 		// When signing leaf nodes (which naturally only have a single output) fill in
 		// the dummy pkscript as output script.
@@ -223,7 +215,7 @@ func signNode(t *testing.T, node *Node, redeemBranch redeemBranch) {
 		t.Fatal(err)
 	}
 
-	privKey := genGroupMuSigPrivKey(nbKeys, keys...)
+	privKey := genGroupMuSigPrivKey(tag, nbKeys, keys...)
 	pubKeyData := privKey.PubKey().SerializeCompressed()
 
 	rawSig, err := txscript.RawTxInSignature(node.Tx, 0, redeemScript,

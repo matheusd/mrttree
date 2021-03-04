@@ -2,6 +2,7 @@ package mrttree
 
 import (
 	"fmt"
+	"hash"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/crypto/blake256"
@@ -28,21 +29,29 @@ func scalarMultKey(s *secp256k1.ModNScalar, k *secp256k1.PublicKey) secp256k1.Pu
 	return *resp
 }
 
+func taggedHasher(tag string) hash.Hash {
+	taghash := blake256.Sum256([]byte(tag))
+	hasher := blake256.New()
+	hasher.Write(taghash[:])
+	hasher.Write(taghash[:])
+	return hasher
+}
+
 func musigKeyTweak(L *chainhash.Hash, pubSer []byte) (secp256k1.ModNScalar, error) {
-	var buff [32 + 33]byte
-	copy(buff[:32], L[:])
-	copy(buff[32:], pubSer)
-	tweakBytes := blake256.Sum256(buff[:])
+	hasher := taggedHasher("muSigKeyTweak")
+	hasher.Write(L[:])
+	hasher.Write(pubSer)
+	tweakBytes := hasher.Sum(nil)
 
 	// TODO: bounds check tweakBytes (= 0, >= q)
 
 	var res secp256k1.ModNScalar
-	res.SetBytes(&tweakBytes)
+	res.SetByteSlice(tweakBytes)
 	return res, nil
 }
 
-func hashKeys(keys ...[]byte) chainhash.Hash {
-	hasher := blake256.New()
+func hashKeys(tag string, keys ...[]byte) chainhash.Hash {
+	hasher := taggedHasher(tag)
 	for _, key := range keys {
 		hasher.Write(key)
 	}
@@ -51,8 +60,8 @@ func hashKeys(keys ...[]byte) chainhash.Hash {
 	return res
 }
 
-func hashPubKeys(keys ...*secp256k1.PublicKey) chainhash.Hash {
-	hasher := blake256.New()
+func hashPubKeys(tag string, keys ...*secp256k1.PublicKey) chainhash.Hash {
+	hasher := taggedHasher(tag)
 	for _, key := range keys {
 		hasher.Write(key.SerializeCompressed())
 	}
@@ -61,21 +70,26 @@ func hashPubKeys(keys ...*secp256k1.PublicKey) chainhash.Hash {
 	return res
 }
 
-func musigGroupKey(keys []*secp256k1.PublicKey, serKeys [][]byte) (*secp256k1.PublicKey, *chainhash.Hash, error) {
+func mergeKeySlices(s1, s2 []*secp256k1.PublicKey) []*secp256k1.PublicKey {
+	r := make([]*secp256k1.PublicKey, 0, len(s1)+len(s2))
+	r = append(r, s1...)
+	r = append(r, s2...)
+	return r
+}
 
-	L := hashKeys(serKeys...)
+func musigGroupKey(tag string, keys []*secp256k1.PublicKey, serKeys [][]byte) (*secp256k1.PublicKey, *chainhash.Hash, error) {
+
+	L := hashKeys(tag, serKeys...)
 	var buff [32 + 33]byte
 	copy(buff[:32], L[:])
 
 	var groupKey secp256k1.PublicKey
-	var tweakModN secp256k1.ModNScalar
 
 	for i, key := range keys {
-		copy(buff[32:], serKeys[i])
-		tweak := blake256.Sum256(buff[:])
-
-		// TODO: bounds check tweak (== 0, >= q)
-		tweakModN.SetBytes(&tweak)
+		tweakModN, err := musigKeyTweak(&L, serKeys[i])
+		if err != nil {
+			return nil, nil, err
+		}
 
 		tweakedKey := scalarMultKey(&tweakModN, key)
 		groupKey = addPubKeys(&groupKey, &tweakedKey)
@@ -84,12 +98,12 @@ func musigGroupKey(keys []*secp256k1.PublicKey, serKeys [][]byte) (*secp256k1.Pu
 	return &groupKey, &L, nil
 }
 
-func musigGroupKeyFromKeys(keys ...*secp256k1.PublicKey) (*secp256k1.PublicKey, *chainhash.Hash, error) {
+func musigGroupKeyFromKeys(tag string, keys ...*secp256k1.PublicKey) (*secp256k1.PublicKey, *chainhash.Hash, error) {
 	serKeys := make([][]byte, len(keys))
 	for i, key := range keys {
 		serKeys[i] = key.SerializeCompressed()
 	}
-	return musigGroupKey(keys, serKeys)
+	return musigGroupKey(tag, keys, serKeys)
 }
 
 func sumKeys(pubs []*secp256k1.PublicKey) *secp256k1.PublicKey {

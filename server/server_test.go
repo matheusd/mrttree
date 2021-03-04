@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"testing"
 
@@ -11,7 +10,6 @@ import (
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrutil/v3"
-	"github.com/decred/dcrd/txscript/v3"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -21,37 +19,47 @@ const (
 )
 
 var (
-	dummyPkScript  = []byte{0x76, 0xa9, 0x14, 23: 0x88, 24: 0xac}
 	testChangePriv = secp256k1.PrivKeyFromBytes([]byte{0x01, 0x02, 0x03, 0x04})
 	testChangePub  = testChangePriv.PubKey()
-
-	/*
-		providerKey     = secp256k1.PrivKeyFromBytes([]byte{providerKeyInt}).PubKey()
-		providerSellKey = secp256k1.PrivKeyFromBytes([]byte{providerSellKeyInt}).PubKey()
-		userKey         = secp256k1.PrivKeyFromBytes([]byte{userKeyInt}).PubKey()
-		userSellKey     = secp256k1.PrivKeyFromBytes([]byte{userSellKeyInt}).PubKey()
-
-		simnetParams          = chaincfg.SimNetParams()
-		opTrueScript          = []byte{txscript.OP_TRUE}
-		opTrueRedeemScript    = []byte{txscript.OP_DATA_1, txscript.OP_TRUE}
-		opTrueP2SHAddr, _     = dcrutil.NewAddressScriptHash(opTrueScript, simnetParams)
-		opTrueP2SHPkScript, _ = txscript.PayToAddrScript(opTrueP2SHAddr)
-	*/
 )
 
-func testCfg() *Config {
+func testCfg(t *testing.T, nbLeafs int) *Config {
 	outp := wire.OutPoint{Hash: chainhash.Hash{0: 0x01}}
+
+	// Handle the provider as if it were another user.
+	user := mrttree.NewTestUser(t, "provider", 0x99123192, nbLeafs)
 	return &Config{
 		ChangeKeySourcer: func(ctx context.Context) (*secp256k1.PublicKey, error) {
 			return testChangePub, nil
 		},
+
+		TreeKeySourcer: func(ctx context.Context, nbLeafs int) ([]*secp256k1.PublicKey, error) {
+			keys := make([]*secp256k1.PublicKey, nbLeafs)
+			for i := range keys {
+				keys[i], _ = secp256k1.ParsePubKey(user.Keys[i])
+			}
+			return keys, nil
+		},
+
+		TreeNoncer: func(ctx context.Context, tree *mrttree.Tree) (map[uint32][][]byte, [][]byte, error) {
+			err := user.GenerateNonces(tree)
+			return user.TreeNonces, user.FundNonces, err
+		},
+
+		TreeSigner: func(ctx context.Context, tree *mrttree.Tree, allNonces map[uint32][][]byte, allFundNonces [][]byte) (map[uint32][][]byte, [][]byte, error) {
+			err := user.SignTree(allNonces, allFundNonces)
+			return user.TreeSigs, user.FundSigs, err
+		},
+
 		InputSourcer: func(ctx context.Context, amount dcrutil.Amount) ([]*wire.TxIn, error) {
 			in := wire.NewTxIn(&outp, int64(amount*2), nil)
 			return []*wire.TxIn{in}, nil
 		},
+
 		InputReleaser: func(ctx context.Context, inputs []*wire.TxIn) error {
 			return nil
 		},
+
 		TxFeeRate: defaultFeeRate,
 		Rand:      rand.New(rand.NewSource(0x81234567)),
 	}
@@ -114,94 +122,22 @@ func buildTree(t *testing.T, joinRes *api.JoinSessionResponse, keysRes *api.Reve
 	return tree
 }
 
-func verifySignedNode(node *mrttree.Node, noncesRes *api.RevealNoncesResponse,
-	sigsRes *api.SignedTreeResponse) error {
-
-	var s secp256k1.ModNScalar
-	s.SetByteSlice(sigsRes.TreeSignatures[node.Index])
-
-	allNonces := noncesRes.TreeNonces[node.Index].Data
-	R, err := mrttree.ProduceR(allNonces)
-	if err != nil {
-		return err
-	}
-
-	if err := node.AssembleLockedSigScript(R, &s); err != nil {
-		return err
-	}
-
-	prevOut := node.PrevOutput
-	vm, err := txscript.NewEngine(prevOut.PkScript, node.Tx, 0,
-		testScriptFlags, prevOut.Version, nil)
-	if err != nil {
-		return err
-	}
-	err = vm.Execute()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func verifySignedFundTx(tree *mrttree.Tree, noncesRes *api.RevealNoncesResponse,
-	sigsRes *api.SignedTreeResponse) error {
-
-	var s secp256k1.ModNScalar
-	s.SetByteSlice(sigsRes.FundSignature)
-
-	R, err := mrttree.ProduceR(noncesRes.FundNonces)
-	if err != nil {
-		return err
-	}
-
-	if err := tree.AssembleLockedSigScript(R, &s); err != nil {
-		return err
-	}
-
-	prevOut := tree.PrefundTx.TxOut[0]
-	vm, err := txscript.NewEngine(prevOut.PkScript, tree.Tx, 0,
-		testScriptFlags, prevOut.Version, nil)
-	if err != nil {
-		return err
-	}
-	err = vm.Execute()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func verifySignedTree(tree *mrttree.Tree, noncesRes *api.RevealNoncesResponse,
 	sigsRes *api.SignedTreeResponse) error {
 
-	nodes := make([]*mrttree.Node, 0)
-	nodes = append(nodes, tree.Root)
-	for len(nodes) > 0 {
-		l := len(nodes)
-		node := nodes[l-1]
-		nodes = nodes[:l-1]
-		if node.Leaf {
-			continue
-		}
-		nodes = append(nodes, node.Children[:]...)
-
-		if err := verifySignedNode(node, noncesRes, sigsRes); err != nil {
-			return err
-		}
+	treeNonces := unmarshalMapByteSlices(noncesRes.TreeNonces)
+	err := tree.FillTxSignatures(treeNonces, sigsRes.TreeSignatures,
+		noncesRes.FundNonces, sigsRes.FundSignature)
+	if err != nil {
+		return err
 	}
 
-	if err := verifySignedFundTx(tree, noncesRes, sigsRes); err != nil {
-		return fmt.Errorf("verifySignedFundTx failed: %v", err)
-	}
-
-	return nil
+	return tree.VerifyTxSignatures()
 }
 
 func TestBasicRoundtrip(t *testing.T) {
-	cfg := testCfg()
-	rnd := rand.New(rand.NewSource(0x12345678))
+	nbLeafs := 2
+	cfg := testCfg(t, nbLeafs)
 
 	svr, err := NewServer(cfg)
 	if err != nil {
@@ -211,22 +147,12 @@ func TestBasicRoundtrip(t *testing.T) {
 	go svr.Run(testCtx(t))
 
 	// Generate a new session.
-	nbLeafs := 2
 	lockTime := uint32(10)
 	initialLockTime := lockTime * 3
 	leafAmount := dcrutil.Amount(coin)
-	providerPrivs := make(map[[33]byte]*secp256k1.PrivateKey, nbLeafs)
-	providerKeys := make([]*secp256k1.PublicKey, nbLeafs)
-	for i := 0; i < nbLeafs; i++ {
-		var p [33]byte
-		priv := randKey(rnd)
-		copy(p[:], priv.PubKey().SerializeCompressed())
-		providerKeys[i] = priv.PubKey()
-		providerPrivs[p] = priv
-	}
 
 	_, sessID, err := svr.newSession(nbLeafs, leafAmount, lockTime,
-		initialLockTime, providerKeys)
+		initialLockTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +191,9 @@ func TestBasicRoundtrip(t *testing.T) {
 	t.Logf("tree tx hash: %s", tree.Tx.TxHash())
 
 	// Now generate enough nonces for the user to send on the next step.
-	user.GenerateNonces(tree)
+	if err := user.GenerateNonces(tree); err != nil {
+		t.Fatal(err)
+	}
 
 	// Third: Commit to nonces.
 	nonceHashesReq := &api.CommitToNoncesRequest{
@@ -312,6 +240,5 @@ func TestBasicRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = sigsRes
 	_ = nonceHashesRes
 }
