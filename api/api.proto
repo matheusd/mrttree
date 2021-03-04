@@ -17,8 +17,6 @@ message JoinSessionRequest {
     uint32 protocol_version = 1;
     bytes session_id = 2;
     repeated bytes user_pk_hashes = 3;
-    repeated bytes user_sellable_pk_hashes = 4;
-    repeated bytes fund_pk_hashes = 5;
 }
 
 message JoinSessionResponse {
@@ -30,16 +28,12 @@ message JoinSessionResponse {
     int64 tx_fee_rate = 10;
     int64 leaf_amount = 11;
     repeated bytes user_pk_hashes = 5;
-    repeated bytes user_sellable_pk_hashes = 6;
-    repeated bytes fund_pk_hashes = 8;
     repeated bytes provider_pk_hashes = 7;
 }
 
 message RevealLeafKeysRequest {
     bytes session_token = 1;
     repeated bytes user_keys = 2;
-    repeated bytes user_sellable_keys = 3;
-    repeated bytes fund_keys = 4;
     repeated bytes user_ivs = 10;
     }
 
@@ -55,8 +49,6 @@ message RevealLeafKeysResponse {
     repeated input prefund_inputs = 1;
     repeated input fund_additional_inputs = 2;
     repeated bytes user_keys = 3;
-    repeated bytes user_sellable_keys = 4;
-    repeated bytes fund_keys = 5;
     repeated bytes user_ivs = 6;
     repeated bytes provider_keys = 9;
     repeated bytes provider_ivs = 10;

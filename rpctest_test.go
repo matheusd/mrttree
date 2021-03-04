@@ -156,12 +156,9 @@ func TestRpcTest(t *testing.T) {
 	leafs := make([]ProposedLeaf, nbLeafs)
 	for i := 0; i < len(leafs); i++ {
 		leafs[i] = ProposedLeaf{
-			Amount:              dcrutil.Amount(coin),
-			ProviderKey:         *providerKey,
-			ProviderSellableKey: *providerSellKey,
-			UserKey:             *userKey,
-			UserSellableKey:     *userSellKey,
-			FundKey:             *fundKey,
+			Amount:      dcrutil.Amount(coin),
+			ProviderKey: *providerKey,
+			UserKey:     *userKey,
 		}
 	}
 	proposal := &ProposedTree{

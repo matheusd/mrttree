@@ -46,8 +46,6 @@ type userSession struct {
 	fundNonceHashes [][]byte
 
 	userKeys   [][]byte
-	sellKeys   [][]byte
-	fundKeys   [][]byte
 	userIVs    [][]byte
 	treeNonces map[uint32][][]byte
 	fundNonces [][]byte
@@ -80,13 +78,9 @@ type session struct {
 	providerFundSigs        [][]byte
 
 	allUserPkHashes     [][]byte
-	allSellPkHashes     [][]byte
-	allFundPkHashes     [][]byte
 	allProviderPkHashes [][]byte
 	allUserIVs          [][]byte
 	allUserKeys         [][]byte
-	allSellKeys         [][]byte
-	allFundKeys         [][]byte
 	allProviderIVs      [][]byte
 	allProviderKeys     [][]byte
 	allTreeNonceHashes  map[uint32][][]byte
@@ -144,33 +138,21 @@ func (sess *session) newUserSession() (*userSession, error) {
 
 func (sess *session) start() {
 	allUserHashes := make([][]byte, 0, sess.nbLeafs)
-	allSellHashes := make([][]byte, 0, sess.nbLeafs)
-	allFundHashes := make([][]byte, 0, sess.nbLeafs)
 	for _, us := range sess.userSessions {
 		allUserHashes = append(allUserHashes, us.userPkHashes...)
-		allSellHashes = append(allSellHashes, us.sellPkHashes...)
-		allFundHashes = append(allFundHashes, us.fundPkHashes...)
 	}
 	// TODO: shuffle entries since order doesn't matter.
 	sess.allUserPkHashes = allUserHashes
-	sess.allSellPkHashes = allSellHashes
-	sess.allFundPkHashes = allFundHashes
 }
 
 func (sess *session) keysFilled() {
 	allUserKeys := make([][]byte, 0, sess.nbLeafs)
-	allSellKeys := make([][]byte, 0, sess.nbLeafs)
-	allFundKeys := make([][]byte, 0, sess.nbLeafs)
 	allUserIVs := make([][]byte, 0, sess.nbLeafs)
 	for _, us := range sess.userSessions {
 		allUserKeys = append(allUserKeys, us.userKeys...)
-		allSellKeys = append(allSellKeys, us.sellKeys...)
-		allFundKeys = append(allFundKeys, us.fundKeys...)
 		allUserIVs = append(allUserIVs, us.userIVs...)
 	}
 	sess.allUserKeys = allUserKeys
-	sess.allSellKeys = allSellKeys
-	sess.allFundKeys = allFundKeys
 	sess.allUserIVs = allUserIVs
 
 	// TODO: Pre-sort keys according to cannonical ordering in the tree.
@@ -183,25 +165,14 @@ func (sess *session) createTree() error {
 		if err != nil {
 			return err
 		}
-		sellKey, err := secp256k1.ParsePubKey(sess.allSellKeys[i])
-		if err != nil {
-			return err
-		}
 		providerKey, err := secp256k1.ParsePubKey(sess.allProviderKeys[i])
 		if err != nil {
 			return err
 		}
-		fundKey, err := secp256k1.ParsePubKey(sess.allFundKeys[i])
-		if err != nil {
-			return err
-		}
 		leafs[i] = mrttree.ProposedLeaf{
-			Amount:              dcrutil.Amount(sess.leafAmount),
-			ProviderKey:         *providerKey,
-			ProviderSellableKey: *providerKey,
-			UserKey:             *userKey,
-			UserSellableKey:     *sellKey,
-			FundKey:             *fundKey,
+			Amount:      dcrutil.Amount(sess.leafAmount),
+			ProviderKey: *providerKey,
+			UserKey:     *userKey,
 		}
 	}
 

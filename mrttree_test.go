@@ -17,23 +17,17 @@ import (
 )
 
 const (
-	providerKeyInt     byte = 1
-	providerSellKeyInt      = 2
-	userKeyInt              = 3
-	userSellKeyInt          = 4
-	fundKeyInt              = 5
+	providerKeyInt byte = 1
+	userKeyInt          = 3
 
 	defaultFeeRate dcrutil.Amount = 1e4
 	coin           int64          = 1e8
 )
 
 var (
-	dummyPkScript   = []byte{0x76, 0xa9, 0x14, 23: 0x88, 24: 0xac}
-	providerKey     = secp256k1.PrivKeyFromBytes([]byte{providerKeyInt}).PubKey()
-	providerSellKey = secp256k1.PrivKeyFromBytes([]byte{providerSellKeyInt}).PubKey()
-	userKey         = secp256k1.PrivKeyFromBytes([]byte{userKeyInt}).PubKey()
-	userSellKey     = secp256k1.PrivKeyFromBytes([]byte{userSellKeyInt}).PubKey()
-	fundKey         = secp256k1.PrivKeyFromBytes([]byte{fundKeyInt}).PubKey()
+	dummyPkScript = []byte{0x76, 0xa9, 0x14, 23: 0x88, 24: 0xac}
+	providerKey   = secp256k1.PrivKeyFromBytes([]byte{providerKeyInt}).PubKey()
+	userKey       = secp256k1.PrivKeyFromBytes([]byte{userKeyInt}).PubKey()
 
 	simnetParams          = chaincfg.SimNetParams()
 	opTrueScript          = []byte{txscript.OP_TRUE}
@@ -280,11 +274,9 @@ func TestBuildTree(t *testing.T) {
 
 	for i := 0; i < len(leafs); i++ {
 		leafs[i] = ProposedLeaf{
-			Amount:              1e8,
-			ProviderKey:         *providerKey,
-			ProviderSellableKey: *providerSellKey,
-			UserKey:             *userKey,
-			UserSellableKey:     *userSellKey,
+			Amount:      1e8,
+			ProviderKey: *providerKey,
+			UserKey:     *userKey,
 		}
 	}
 	proposal := &ProposedTree{

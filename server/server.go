@@ -169,11 +169,6 @@ func (s *Server) failSession(sess *session, err error) {
 
 func (s *Server) JoinSession(ctx context.Context, req *api.JoinSessionRequest) (*api.JoinSessionResponse, error) {
 
-	if len(req.UserSellablePkHashes) != len(req.UserPkHashes) ||
-		len(req.UserPkHashes) != len(req.FundPkHashes) {
-		return nil, fmt.Errorf("incongruent number of key hashes")
-	}
-
 	// Verify the session by this id exists.
 	s.mtx.Lock()
 	var sessID sessionID
@@ -224,8 +219,6 @@ func (s *Server) JoinSession(ctx context.Context, req *api.JoinSessionRequest) (
 	// Register the new waiting user.
 	waitingSess.nbWaitingLeafs += len(req.UserPkHashes)
 	userSess.userPkHashes = req.UserPkHashes
-	userSess.sellPkHashes = req.UserSellablePkHashes
-	userSess.fundPkHashes = req.FundPkHashes
 
 	if startsSession {
 		sess.start()
@@ -272,17 +265,15 @@ func (s *Server) JoinSession(ctx context.Context, req *api.JoinSessionRequest) (
 	sess.Lock()
 	userSess.state = ussWaitingKeys
 	resp := &api.JoinSessionResponse{
-		SessionToken:         userSess.token[:],
-		LockTime:             sess.lockTime,
-		InitialLockTime:      sess.initialLockTime,
-		FundLockTime:         sess.fundLockTime,
-		ChangeKey:            sess.changeKey.SerializeCompressed(),
-		TxFeeRate:            int64(sess.txFeeRate),
-		LeafAmount:           int64(sess.leafAmount),
-		UserPkHashes:         sess.allUserPkHashes,
-		UserSellablePkHashes: sess.allSellPkHashes,
-		FundPkHashes:         sess.allFundPkHashes,
-		ProviderPkHashes:     sess.allProviderPkHashes,
+		SessionToken:     userSess.token[:],
+		LockTime:         sess.lockTime,
+		InitialLockTime:  sess.initialLockTime,
+		FundLockTime:     sess.fundLockTime,
+		ChangeKey:        sess.changeKey.SerializeCompressed(),
+		TxFeeRate:        int64(sess.txFeeRate),
+		LeafAmount:       int64(sess.leafAmount),
+		UserPkHashes:     sess.allUserPkHashes,
+		ProviderPkHashes: sess.allProviderPkHashes,
 	}
 
 	sess.Unlock()
@@ -292,12 +283,6 @@ func (s *Server) JoinSession(ctx context.Context, req *api.JoinSessionRequest) (
 
 func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequest) (*api.RevealLeafKeysResponse, error) {
 
-	if len(req.UserSellableKeys) != len(req.UserKeys) {
-		return nil, fmt.Errorf("inconsistent nb of sellable keys and keys")
-	}
-	if len(req.FundKeys) != len(req.UserKeys) {
-		return nil, fmt.Errorf("inconsistent nb of fund keys and keys")
-	}
 	if len(req.UserIvs) != len(req.UserKeys) {
 		return nil, fmt.Errorf("inconsistent nb of keys and ivs")
 	}
@@ -322,8 +307,6 @@ func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequ
 	}
 	userSess.state = ussVerifyingKeys
 	userHashes := userSess.userPkHashes
-	sellHashes := userSess.sellPkHashes
-	fundHashes := userSess.fundPkHashes
 	nbUserLeafs := len(userHashes)
 	sess.Unlock()
 
@@ -334,12 +317,6 @@ func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequ
 	if err := verifyKeyIVHashes(req.UserKeys, req.UserIvs, userHashes); err != nil {
 		return nil, err
 	}
-	if err := verifyKeyIVHashes(req.UserSellableKeys, req.UserIvs, sellHashes); err != nil {
-		return nil, err
-	}
-	if err := verifyKeyIVHashes(req.FundKeys, req.UserIvs, fundHashes); err != nil {
-		return nil, err
-	}
 
 	// Verify all pubkeys are sane.
 	//
@@ -347,17 +324,9 @@ func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequ
 	if err := verifySanePubKeys(req.UserKeys); err != nil {
 		return nil, err
 	}
-	if err := verifySanePubKeys(req.UserSellableKeys); err != nil {
-		return nil, err
-	}
-	if err := verifySanePubKeys(req.FundKeys); err != nil {
-		return nil, err
-	}
 
 	sess.Lock()
 	userSess.userKeys = req.UserKeys
-	userSess.sellKeys = req.UserSellableKeys
-	userSess.fundKeys = req.FundKeys
 	userSess.state = ussWaitingAllKeys
 	sess.nbFilledKeys += nbUserLeafs
 	gotAllKeys := sess.gotAllKeys
@@ -396,13 +365,11 @@ func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequ
 	sess.Lock()
 	userSess.state = ussWaitingNonceHashes
 	resp := &api.RevealLeafKeysResponse{
-		PrefundInputs:    marshalPrefundInputs(sess.inputs),
-		UserKeys:         sess.allUserKeys,
-		UserSellableKeys: sess.allSellKeys,
-		FundKeys:         sess.allFundKeys,
-		UserIvs:          sess.allUserIVs,
-		ProviderKeys:     sess.allProviderKeys,
-		ProviderIvs:      sess.allProviderIVs,
+		PrefundInputs: marshalPrefundInputs(sess.inputs),
+		UserKeys:      sess.allUserKeys,
+		UserIvs:       sess.allUserIVs,
+		ProviderKeys:  sess.allProviderKeys,
+		ProviderIvs:   sess.allProviderIVs,
 	}
 	sess.Unlock()
 

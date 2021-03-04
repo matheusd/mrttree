@@ -73,25 +73,14 @@ func buildTree(t *testing.T, joinRes *api.JoinSessionResponse, keysRes *api.Reve
 		if err != nil {
 			t.Fatal(err)
 		}
-		sellKey, err := secp256k1.ParsePubKey(keysRes.UserSellableKeys[i])
-		if err != nil {
-			t.Fatal(err)
-		}
 		providerKey, err := secp256k1.ParsePubKey(keysRes.ProviderKeys[i])
 		if err != nil {
 			t.Fatal(err)
 		}
-		fundKey, err := secp256k1.ParsePubKey(keysRes.FundKeys[i])
-		if err != nil {
-			t.Fatal(err)
-		}
 		leafs[i] = mrttree.ProposedLeaf{
-			Amount:              dcrutil.Amount(joinRes.LeafAmount),
-			ProviderKey:         *providerKey,
-			ProviderSellableKey: *providerKey,
-			UserKey:             *userKey,
-			UserSellableKey:     *sellKey,
-			FundKey:             *fundKey,
+			Amount:      dcrutil.Amount(joinRes.LeafAmount),
+			ProviderKey: *providerKey,
+			UserKey:     *userKey,
 		}
 	}
 
@@ -162,10 +151,8 @@ func TestBasicRoundtrip(t *testing.T) {
 
 	// First: attempt to join a session, committing to keys.
 	joinReq := &api.JoinSessionRequest{
-		SessionId:            sessID[:],
-		UserPkHashes:         user.KeysHashes,
-		UserSellablePkHashes: user.SellHashes,
-		FundPkHashes:         user.FundHashes,
+		SessionId:    sessID[:],
+		UserPkHashes: user.KeysHashes,
 	}
 	joinRes, err := svr.JoinSession(testCtx(t), joinReq)
 	if err != nil {
@@ -174,11 +161,9 @@ func TestBasicRoundtrip(t *testing.T) {
 
 	// Second: Send keys.
 	keysReq := &api.RevealLeafKeysRequest{
-		SessionToken:     joinRes.SessionToken,
-		UserKeys:         user.Keys,
-		UserSellableKeys: user.Sell,
-		FundKeys:         user.Fund,
-		UserIvs:          user.UserIVs,
+		SessionToken: joinRes.SessionToken,
+		UserKeys:     user.Keys,
+		UserIvs:      user.UserIVs,
 	}
 	keysRes, err := svr.RevealLeafKeys(testCtx(t), keysReq)
 	if err != nil {

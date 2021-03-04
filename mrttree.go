@@ -27,11 +27,8 @@ const (
 )
 
 type Node struct {
-	ProviderKey         secp256k1.PublicKey
-	ProviderSellableKey secp256k1.PublicKey
-	UserKey             secp256k1.PublicKey
-	UserSellableKey     secp256k1.PublicKey
-	FundKey             secp256k1.PublicKey
+	ProviderKey secp256k1.PublicKey
+	UserKey     secp256k1.PublicKey
 
 	Parent      *Node
 	ParentIndex int
@@ -368,12 +365,9 @@ func (tree *Tree) VerifyTxSignatures() error {
 }
 
 type ProposedLeaf struct {
-	ProviderKey         secp256k1.PublicKey
-	ProviderSellableKey secp256k1.PublicKey
-	UserKey             secp256k1.PublicKey
-	UserSellableKey     secp256k1.PublicKey
-	Amount              dcrutil.Amount
-	FundKey             secp256k1.PublicKey
+	ProviderKey secp256k1.PublicKey
+	UserKey     secp256k1.PublicKey
+	Amount      dcrutil.Amount
 }
 
 type ProposedTree struct {
@@ -408,16 +402,13 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 	for i := nbLeafs - 1; i >= 0; i-- {
 		leaf := leafs[i]
 		node := &Node{
-			ProviderKey:         leaf.ProviderKey,
-			ProviderSellableKey: leaf.ProviderSellableKey,
-			UserKey:             leaf.UserKey,
-			UserSellableKey:     leaf.UserSellableKey,
-			FundKey:             leaf.FundKey,
-			Amount:              leaf.Amount,
-			Index:               uint32(i),
-			Tree:                tree,
-			Leaf:                true,
-			LeafCount:           1,
+			ProviderKey: leaf.ProviderKey,
+			UserKey:     leaf.UserKey,
+			Amount:      leaf.Amount,
+			Index:       uint32(i),
+			Tree:        tree,
+			Leaf:        true,
+			LeafCount:   1,
 		}
 		stack0.push(node)
 		tree.Leafs[i] = node
@@ -438,14 +429,6 @@ func buildTree(tree *Tree, proposal *ProposedTree) error {
 
 				// Non-leaf keys are the sum of the child keys.
 				parent := &Node{
-					ProviderKey: addPubKeys(&n0.ProviderKey,
-						&n1.ProviderKey),
-					ProviderSellableKey: addPubKeys(&n0.ProviderSellableKey,
-						&n1.ProviderSellableKey),
-					UserKey: addPubKeys(&n0.UserKey,
-						&n1.UserKey),
-					UserSellableKey: addPubKeys(&n0.UserSellableKey,
-						&n1.UserSellableKey),
 					Amount:   n0.Amount + n1.Amount + nodeFee,
 					Children: [2]*Node{n0, n1},
 					Tree:     tree,
