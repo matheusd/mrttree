@@ -89,6 +89,7 @@ type session struct {
 	allFundNonces       [][]byte
 	allTreeSigs         map[uint32][]byte
 	fundSig             []byte
+	fundSigPub          []byte
 
 	lockTime        uint32
 	initialLockTime uint32
@@ -337,15 +338,37 @@ func (sess *session) signaturesFilled() error {
 	sess.allTreeSigs = allTreeSigs
 	sess.fundSig = fundSigBytes[:]
 
-	// Finally, fill the signatureScript in the tree transactions.
-	err := sess.tree.FillTxSignatures(sess.allTreeNonces, sess.allTreeSigs,
-		sess.allFundNonces, sess.fundSig)
-	if err != nil {
-		return nil
+	// Finally, fill the signatureScript in the tree transactions and the
+	// fund transaction.
+	if err := sess.tree.FillTreeSignatures(sess.allTreeNonces, sess.allTreeSigs); err != nil {
+		return err
+	}
+	if err := sess.tree.FillFundSignature(sess.allFundNonces, sess.fundSig); err != nil {
+		return err
 	}
 
 	// And verify the signatures are correct.
-	return sess.tree.VerifyTxSignatures()
+	if err := sess.tree.VerifyTreeSignatures(); err != nil {
+		return err
+	}
+	if err := sess.tree.VerifyFundSignature(); err != nil {
+		return err
+	}
+
+	// Calculate the public point corresponding to the sig scalar.
+	var fundSigPubPoint secp256k1.JacobianPoint
+	secp256k1.ScalarBaseMultNonConst(&fundSig, &fundSigPubPoint)
+	fundSigPubPoint.ToAffine()
+	fundSigPub := secp256k1.NewPublicKey(&fundSigPubPoint.X, &fundSigPubPoint.Y)
+	sess.fundSigPub = fundSigPub.SerializeCompressed()
+
+	// Double check the pub sig validates the tree.
+	err := sess.tree.VerifyFundSignaturePub(sess.allFundNonces, sess.fundSigPub)
+	if err != nil {
+		return fmt.Errorf("unable to verify fund sig pub: %v", err)
+	}
+
+	return nil
 }
 
 type waitingSession struct {

@@ -236,6 +236,10 @@ func (tree *Tree) FundKey() (*secp256k1.PublicKey, *chainhash.Hash, error) {
 	return musigGroupKeyFromKeys(HasherTagFundKey, keys...)
 }
 
+func (tree *Tree) fundScript(fundKey *secp256k1.PublicKey) ([]byte, error) {
+	return fundScript(fundKey, &tree.ChangeKey, tree.FundLockTime)
+}
+
 // FundScript returns the redeemScript of the prefund tx output, spent in the
 // fund tx.
 func (tree *Tree) FundScript() ([]byte, error) {
@@ -243,7 +247,7 @@ func (tree *Tree) FundScript() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fundScript(fundKey, &tree.ChangeKey, tree.FundLockTime)
+	return tree.fundScript(fundKey)
 }
 
 func (tree *Tree) FundP2SH() ([]byte, error) {
@@ -286,9 +290,8 @@ func (tree *Tree) AssembleLockedSigScript(RPub *secp256k1.PublicKey, s *secp256k
 	return err
 }
 
-func (tree *Tree) FillTxSignatures(treeNonces map[uint32][][]byte, treeSigs map[uint32][]byte,
-	fundNonces [][]byte, fundSig []byte) error {
-
+// FillTreeSignatures fills the signature for all transactions in the tree.
+func (tree *Tree) FillTreeSignatures(treeNonces map[uint32][][]byte, treeSigs map[uint32][]byte) error {
 	stack := makeNodeStack(int(tree.Levels + 1))
 	stack.push(tree.Root)
 	for stack.len() > 0 {
@@ -312,22 +315,11 @@ func (tree *Tree) FillTxSignatures(treeNonces map[uint32][][]byte, treeSigs map[
 		}
 	}
 
-	var s secp256k1.ModNScalar
-	s.SetByteSlice(fundSig)
-
-	R, err := ProduceR(fundNonces)
-	if err != nil {
-		return err
-	}
-
-	if err := tree.AssembleLockedSigScript(R, &s); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func (tree *Tree) VerifyTxSignatures() error {
+// VerifyTreeSignatures verifies every signature in the tree executes.
+func (tree *Tree) VerifyTreeSignatures() error {
 	stack := makeNodeStack(int(tree.Levels + 1))
 	stack.push(tree.Root)
 	for stack.len() > 0 {
@@ -350,6 +342,28 @@ func (tree *Tree) VerifyTxSignatures() error {
 		}
 	}
 
+	return nil
+}
+
+// FillFundSignature fills the signature of the fund transactions.
+func (tree *Tree) FillFundSignature(fundNonces [][]byte, fundSig []byte) error {
+	var s secp256k1.ModNScalar
+	s.SetByteSlice(fundSig)
+
+	R, err := ProduceR(fundNonces)
+	if err != nil {
+		return err
+	}
+
+	if err := tree.AssembleLockedSigScript(R, &s); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// VerifyFundSignature verifies the fund transaction signature is correct.
+func (tree *Tree) VerifyFundSignature() error {
 	prevOut := tree.PrefundTx.TxOut[0]
 	vm, err := txscript.NewEngine(prevOut.PkScript, tree.Tx, 0,
 		VerifyScriptFlags, prevOut.Version, nil)
@@ -362,6 +376,40 @@ func (tree *Tree) VerifyTxSignatures() error {
 	}
 
 	return nil
+}
+
+// VerifyFundSignaturePub verifies whether the scalar encoded by the given
+// point corresponds to a valid signature for the funding transaction.
+func (tree *Tree) VerifyFundSignaturePub(fundNonces [][]byte, fundSigPub []byte) error {
+	// Find out R, the group funding key, corresponding script and the
+	// final funding tx sig hash (message signed).
+	R, err := ProduceR(fundNonces)
+	if err != nil {
+		return err
+	}
+
+	sigPub, err := secp256k1.ParsePubKey(fundSigPub)
+	if err != nil {
+		return err
+	}
+
+	fundKey, _, err := tree.FundKey()
+	if err != nil {
+		return err
+	}
+
+	fundScript, err := tree.fundScript(fundKey)
+	if err != nil {
+		return err
+	}
+
+	sigHash, err := txscript.CalcSignatureHash(fundScript,
+		txscript.SigHashAll, tree.Tx, 0, nil)
+	if err != nil {
+		return err
+	}
+
+	return schnorrVerifyWithPubSig(R, sigPub, fundKey, sigHash)
 }
 
 type ProposedLeaf struct {

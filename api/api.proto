@@ -88,7 +88,7 @@ message SignedTreeRequest {
 
 message SignedTreeResponse {
     map<uint32, bytes> tree_signatures = 1;
-    bytes fund_signature = 3;
+    bytes fund_signature_pub = 4;
 }
 
 message UserErrorRequest {

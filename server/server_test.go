@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -115,13 +116,17 @@ func verifySignedTree(tree *mrttree.Tree, noncesRes *api.RevealNoncesResponse,
 	sigsRes *api.SignedTreeResponse) error {
 
 	treeNonces := unmarshalMapByteSlices(noncesRes.TreeNonces)
-	err := tree.FillTxSignatures(treeNonces, sigsRes.TreeSignatures,
-		noncesRes.FundNonces, sigsRes.FundSignature)
+	err := tree.FillTreeSignatures(treeNonces, sigsRes.TreeSignatures)
 	if err != nil {
 		return err
 	}
 
-	return tree.VerifyTxSignatures()
+	err = tree.VerifyFundSignaturePub(noncesRes.FundNonces, sigsRes.FundSignaturePub)
+	if err != nil {
+		return fmt.Errorf("unable to verify fund sig pub: %v", err)
+	}
+
+	return tree.VerifyTreeSignatures()
 }
 
 func TestBasicRoundtrip(t *testing.T) {

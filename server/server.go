@@ -596,8 +596,8 @@ func (s *Server) SignedTree(ctx context.Context, req *api.SignedTreeRequest) (*a
 	sess.Lock()
 	userSess.state = ussDone
 	resp := &api.SignedTreeResponse{
-		TreeSignatures: sess.allTreeSigs,
-		FundSignature:  sess.fundSig,
+		TreeSignatures:   sess.allTreeSigs,
+		FundSignaturePub: sess.fundSigPub,
 	}
 	sess.Unlock()
 

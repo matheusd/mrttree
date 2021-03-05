@@ -287,6 +287,55 @@ func partialMuSigVerify(RPub *secp256k1.PublicKey, L *chainhash.Hash, msg []byte
 	return nil
 }
 
+// schnorrVerifyWithPubSig verifies the scalar of the given sigPub will produce
+// a valid schnorr signature for the given msg and public key, along with the
+// given nonce pub.
+func schnorrVerifyWithPubSig(RPub, sigPub, key *secp256k1.PublicKey, msg []byte) error {
+	const scalarSize = 32
+	var sG, R, P secp256k1.JacobianPoint
+
+	// The verification equation is:
+	//
+	//     sG ?= R - eP
+	//
+	// Rewriting we get:
+	//
+	//    sG + eP ?= R
+	//
+	// Therefore, we calculate eP, add to sG (the sigPub argument) and
+	// verify it equals the public nonce.
+	sigPub.AsJacobian(&sG)
+	RPub.AsJacobian(&R)
+	key.AsJacobian(&P)
+
+	// Calculate the hash commitment e = H(R.x || msg)
+	var commitmentInput [scalarSize * 2]byte
+	R.X.PutBytesUnchecked(commitmentInput[0:scalarSize])
+	copy(commitmentInput[scalarSize:], msg[:])
+	commitment := blake256.Sum256(commitmentInput[:])
+	var e secp256k1.ModNScalar
+	if overflow := e.SetBytes(&commitment); overflow != 0 {
+		str := "hash of (R || m) too big"
+		return fmt.Errorf(str)
+	}
+
+	// Calculate eP
+	var eP secp256k1.JacobianPoint
+	secp256k1.ScalarMultNonConst(&e, &P, &eP)
+
+	// Add to find the challenge = sG + eP.
+	var challenge secp256k1.JacobianPoint
+	secp256k1.AddNonConst(&sG, &eP, &challenge)
+
+	// Ensure they match.
+	challenge.ToAffine()
+	if !challenge.X.Equals(&R.X) {
+		return fmt.Errorf("challenge does not equal expected value")
+	}
+
+	return nil
+}
+
 func sumInputAmounts(ins []*wire.TxIn) int64 {
 	var sum int64
 	for _, in := range ins {
