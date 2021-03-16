@@ -10,6 +10,9 @@ service Mrttree {
     rpc CommitToNonces (CommitToNoncesRequest) returns (CommitToNoncesResponse);
     rpc RevealNonces (RevealNoncesRequest) returns (RevealNoncesResponse);
     rpc SignedTree (SignedTreeRequest) returns (SignedTreeResponse);
+
+    rpc RedeemLeaf (RedeemLeafRequest) returns (RedeemLeafResponse);
+
     rpc UserError (UserErrorRequest) returns (UserErrorResponse);
 }
 
@@ -89,7 +92,16 @@ message SignedTreeRequest {
 message SignedTreeResponse {
     map<uint32, bytes> tree_signatures = 1;
     bytes fund_signature_pub = 4;
+    string ln_pay_req = 5;
 }
+
+message RedeemLeafRequest {
+    bytes session_token = 1;
+    string ln_pay_req = 2;
+    bytes leaf_pub = 3;
+}
+
+message RedeemLeafResponse {}
 
 message UserErrorRequest {
     uint32 session_id = 1;
