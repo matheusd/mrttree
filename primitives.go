@@ -242,8 +242,6 @@ func partialMuSigVerify(RPub *secp256k1.PublicKey, L *chainhash.Hash, msg []byte
 	var P secp256k1.JacobianPoint
 	Ppub.AsJacobian(&P)
 
-	fmt.Printf("OOOOO U %x P %x\n", Upub.SerializeCompressed(), Ppub.SerializeCompressed())
-
 	// The verification equation is:
 	//
 	//     s'G ?= U - H(R || m) * H(L || P) * P

@@ -51,11 +51,14 @@ type userSession struct {
 	fundNonces [][]byte
 	treeSigs   map[uint32][][]byte
 	fundSigs   [][]byte
+
+	privKeys [][]byte
 }
 
 type session struct {
 	sync.RWMutex
 
+	id      sessionID
 	nbLeafs int
 
 	nbFilledKeys int
@@ -69,6 +72,8 @@ type session struct {
 
 	nbFilledSigs int
 	gotAllSigs   chan struct{}
+
+	nbPrivKeys int
 
 	providerTreeNonceHashes map[uint32][][]byte
 	providerTreeNonces      map[uint32][][]byte
@@ -90,6 +95,7 @@ type session struct {
 	allTreeSigs         map[uint32][]byte
 	fundSig             []byte
 	fundSigPub          []byte
+	allUserPrivs        [][]byte
 
 	lockTime        uint32
 	initialLockTime uint32
@@ -194,7 +200,8 @@ func (sess *session) createTree() error {
 	}
 	sess.tree = tree
 
-	fmt.Printf("XXXX server tree tx hash: %s\n", tree.Tx.TxHash())
+	svrLog.Infof("Server tree tx hash for session %x: %s", sess.id,
+		tree.Tx.TxHash())
 
 	// Generate the map from pubkeys to leaf nodes.
 	leafToNodes := tree.BuildLeafPubKeyMap()
@@ -369,6 +376,15 @@ func (sess *session) signaturesFilled() error {
 	}
 
 	return nil
+}
+
+func (sess *session) privKeysReceived() {
+	allPrivs := make([][]byte, 0, sess.nbLeafs)
+	for _, us := range sess.userSessions {
+		allPrivs = append(allPrivs, us.privKeys...)
+	}
+
+	sess.allUserPrivs = allPrivs
 }
 
 type waitingSession struct {

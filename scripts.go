@@ -157,11 +157,11 @@ func calcNodeTxFee(feeRate dcrutil.Amount) int64 {
 
 	tx := wire.MsgTx{
 		TxIn: []*wire.TxIn{
-			{SignatureScript: sigScript},
+			{SignatureScript: sigScript}, // From parent node tx
 		},
 		TxOut: []*wire.TxOut{
-			{PkScript: make([]byte, 23)},
-			{PkScript: make([]byte, 23)},
+			{PkScript: make([]byte, 23)}, // To left child node
+			{PkScript: make([]byte, 23)}, // To right child node
 		},
 	}
 
@@ -195,10 +195,10 @@ func calcLeafRedeemTxFee(feeRate dcrutil.Amount) int64 {
 
 	tx := wire.MsgTx{
 		TxIn: []*wire.TxIn{
-			{SignatureScript: sigScript},
+			{SignatureScript: sigScript}, // From parent node tx
 		},
 		TxOut: []*wire.TxOut{
-			{PkScript: make([]byte, 25)},
+			{PkScript: make([]byte, 25)}, // To final redeem addr
 		},
 	}
 	txSize := tx.SerializeSize()
@@ -207,7 +207,38 @@ func calcLeafRedeemTxFee(feeRate dcrutil.Amount) int64 {
 }
 
 func calcFundTxFee(feeRate dcrutil.Amount, nbAdditionalP2PKHIns int) int64 {
-	return 40000 // TODO: implement
+	orPanic := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// Really crappy way to determine the fee, by creating a full tx.
+	//
+	// TODO: hardcode size, etc.
+	var zeroKey secp256k1.PublicKey
+	var zeroSig schnorr.Signature
+	maxLT := uint32(math.MaxUint32)
+
+	fundRedeemScript, err := fundScript(&zeroKey, &zeroKey, maxLT)
+	orPanic(err)
+	fundSig, err := fundSigScript(&zeroSig, &zeroKey, fundRedeemScript)
+	orPanic(err)
+
+	tx := wire.MsgTx{
+		TxIn: []*wire.TxIn{
+			{SignatureScript: fundSig}, // From prefund tx
+		},
+		TxOut: []*wire.TxOut{
+			{PkScript: make([]byte, 23)}, // To root tx
+		},
+	}
+	txSize := tx.SerializeSize()
+	fee := int64(txSize) * int64(feeRate) / 1000
+
+	// TODO: support additional on-chain inputs+change
+
+	return fee
 }
 
 func CalcFundTxFee(feeRate dcrutil.Amount, nbAdditionalP2PKHIns int) dcrutil.Amount {
@@ -215,7 +246,32 @@ func CalcFundTxFee(feeRate dcrutil.Amount, nbAdditionalP2PKHIns int) dcrutil.Amo
 }
 
 func calcPrefundTxFee(feeRate dcrutil.Amount, nbP2PKHIns int) int64 {
-	return 40000 // TODO: implement
+	// Really crappy way to determine the fee, by creating a full tx.
+	//
+	// TODO: hardcode size, etc.
+	const p2pkhSigScriptSize = 1 + 72 + 1 + 33
+	var sigScript [p2pkhSigScriptSize]byte
+
+	in := &wire.TxIn{SignatureScript: sigScript[:]}
+	ins := make([]*wire.TxIn, nbP2PKHIns)
+	for i := 0; i < nbP2PKHIns; i++ {
+		ins[i] = in
+	}
+
+	tx := wire.MsgTx{
+		TxIn: ins, // From existing on-chain funds
+		TxOut: []*wire.TxOut{
+			{PkScript: make([]byte, 23)}, // To fund tx
+			{PkScript: make([]byte, 25)}, // Change
+		},
+	}
+
+	txSize := tx.SerializeSize()
+	fee := int64(txSize) * int64(feeRate) / 1000
+
+	// TODO: support additional on-chain inputs+change
+
+	return fee
 }
 
 func CalcPrefundTxFee(feeRate dcrutil.Amount, nbP2PKHIns int) dcrutil.Amount {

@@ -13,17 +13,28 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
 	"github.com/decred/dcrd/dcrutil/v3"
 	"github.com/decred/dcrd/wire"
+	"github.com/decred/dcrlnd/lnrpc"
+	"google.golang.org/grpc"
 )
+
+type LNAdapter interface {
+	AddInvoice(ctx context.Context, in *lnrpc.Invoice, opts ...grpc.CallOption) (*lnrpc.AddInvoiceResponse, error)
+	SendPaymentSync(ctx context.Context, in *lnrpc.SendRequest, opts ...grpc.CallOption) (*lnrpc.SendResponse, error)
+}
 
 type Config struct {
 	ChangeKeySourcer func(ctx context.Context) (*secp256k1.PublicKey, error)
 	TreeKeySourcer   func(ctx context.Context, nbLeafs int) ([]*secp256k1.PublicKey, error)
 	TreeNoncer       func(ctx context.Context, tree *mrttree.Tree) (map[uint32][][]byte, [][]byte, error)
 	TreeSigner       func(ctx context.Context, tree *mrttree.Tree, allNonces map[uint32][][]byte, allFundNonces [][]byte) (map[uint32][][]byte, [][]byte, error)
+	TreeRedeemer     func(ctx context.Context, tree *mrttree.Tree, allUserKeys [][]byte) error
 	InputSourcer     func(ctx context.Context, amount dcrutil.Amount) ([]*wire.TxIn, error)
 	InputReleaser    func(ctx context.Context, inputs []*wire.TxIn) error
+	PrefundSigner    func(ctx context.Context, prefundTx *wire.MsgTx) error
+	TxPublisher      func(ctx context.Context, tx *wire.MsgTx) error
 	TxFeeRate        dcrutil.Amount
 	Rand             io.Reader
+	LNClient         LNAdapter
 }
 
 func (cfg *Config) readRand(b []byte) error {
@@ -96,12 +107,18 @@ func (s *Server) newSession(nbLeafs int, leafAmount dcrutil.Amount, lockTime, in
 		}
 		_, ok := s.waitingSessions[sessID]
 		if !ok {
+			sess.id = sessID
 			s.waitingSessions[sessID] = ws
 			break
 		}
 	}
 	s.mtx.Unlock()
 	return sess, sessID, nil
+}
+
+func (s *Server) NewSession(nbLeafs int, leafAmount dcrutil.Amount, lockTime, initialLockTime uint32) (sessionID, error) {
+	_, id, err := s.newSession(nbLeafs, leafAmount, lockTime, initialLockTime)
+	return id, err
 }
 
 func (s *Server) findSession(token sessionToken) (*session, error) {
@@ -167,7 +184,43 @@ func (s *Server) failSession(sess *session, err error) {
 	}()
 }
 
+func (s *Server) publishPrefund(sess *session) {
+	sess.Lock()
+	prefundTx := sess.tree.PrefundTx
+	sess.Unlock()
+
+	err := s.cfg.PrefundSigner(s.ctx, prefundTx)
+	if err != nil {
+		svrLog.Errorf("Prefund signer failed: %v", err)
+		s.failSession(sess, fmt.Errorf("unable to sign prefund tx: %v", err))
+		return
+	}
+
+	err = s.cfg.TxPublisher(s.ctx, prefundTx)
+	if err != nil {
+		svrLog.Errorf("Tx publisher failed: %v", err)
+		s.failSession(sess, fmt.Errorf("unable to publish prefund tx: %v", err))
+		return
+	}
+	svrLog.Infof("Published prefund tx %s", prefundTx.TxHash())
+}
+
+func (s *Server) redeemTree(sess *session) {
+	sess.Lock()
+	tree := sess.tree
+	allPrivs := sess.allUserPrivs
+	sess.Unlock()
+
+	err := s.cfg.TreeRedeemer(s.ctx, tree, allPrivs)
+	if err != nil {
+		svrLog.Errorf("Unable to redeem tree: %v", err)
+	}
+}
+
 func (s *Server) JoinSession(ctx context.Context, req *api.JoinSessionRequest) (*api.JoinSessionResponse, error) {
+	if len(req.UserPkHashes) == 0 {
+		return nil, fmt.Errorf("no pk hashes sent")
+	}
 
 	// Verify the session by this id exists.
 	s.mtx.Lock()
@@ -176,7 +229,7 @@ func (s *Server) JoinSession(ctx context.Context, req *api.JoinSessionRequest) (
 	waitingSess, ok := s.waitingSessions[sessID]
 	if !ok {
 		s.mtx.Unlock()
-		return nil, fmt.Errorf("session %s does not exist", req.SessionId)
+		return nil, fmt.Errorf("session %x does not exist", req.SessionId)
 	}
 	sess := waitingSess.session
 	s.mtx.Unlock()
@@ -336,6 +389,7 @@ func (s *Server) RevealLeafKeys(ctx context.Context, req *api.RevealLeafKeysRequ
 		if err = sess.createTree(); err != nil {
 			s.failSession(sess, fmt.Errorf("unable to create tree: %v", err))
 		} else {
+
 			sess.providerTreeNonces, sess.providerFundNonces, err =
 				s.cfg.TreeNoncer(ctx, sess.tree)
 			if err != nil {
@@ -564,6 +618,7 @@ func (s *Server) SignedTree(ctx context.Context, req *api.SignedTreeRequest) (*a
 	userSess.fundSigs = req.FundSignatures
 	sess.nbFilledSigs += 1
 	gotAllSigs := sess.gotAllSigs
+	totalUserInput := dcrutil.Amount(len(userSess.userPkHashes)) * sess.leafAmount // + fees
 	if sess.nbFilledSigs == len(sess.userSessions) {
 		// All user signatures received, provider will sign.
 		var err error
@@ -574,7 +629,8 @@ func (s *Server) SignedTree(ctx context.Context, req *api.SignedTreeRequest) (*a
 			if err := sess.signaturesFilled(); err != nil {
 				s.failSession(sess, fmt.Errorf("unable to fill tree sigs: %v", err))
 			} else {
-
+				// Publish the prefund tx.
+				go s.publishPrefund(sess)
 				close(gotAllSigs)
 			}
 		}
@@ -601,7 +657,80 @@ func (s *Server) SignedTree(ctx context.Context, req *api.SignedTreeRequest) (*a
 	}
 	sess.Unlock()
 
+	// Generate an LN invoice for this user to send his funds and receive
+	// back the full funding tx sig.
+	//
+	// TODO: add a per-use tweak so multiple invoices can be generated on a
+	// single session.
+	invoice := &lnrpc.Invoice{
+		Memo:      "MRTTREE purchase",
+		RPreimage: sess.fundSig,
+		IsPtlc:    true,
+		Value:     int64(totalUserInput),
+	}
+	invoiceRes, err := s.cfg.LNClient.AddInvoice(ctx, invoice)
+	if err != nil {
+		s.failSession(sess, fmt.Errorf("failed to generate invoice: %v", err))
+		return nil, err
+	}
+
+	resp.LnPayReq = invoiceRes.PaymentRequest
+
 	return resp, nil
+}
+
+func (s *Server) RedeemLeaf(ctx context.Context, req *api.RedeemLeafRequest) (*api.RedeemLeafResponse, error) {
+	// TODO: it shouldn't be the per-user session token but rather the
+	// global session id.
+	var sessToken sessionToken
+	copy(sessToken[:], req.SessionToken)
+	sess, err := s.findSession(sessToken)
+	if err != nil {
+		return nil, err
+	}
+
+	sess.Lock()
+	amount := sess.leafAmount // + fees?
+	userSess, ok := sess.userSessions[sessToken]
+	if !ok {
+		// Shouldn't happen, but err on side of caution.
+		sess.Unlock()
+		return nil, fmt.Errorf("user session %x not found", sessToken)
+	}
+	if userSess.state != ussDone {
+		sess.Unlock()
+		return nil, fmt.Errorf("user session already advanced the state")
+	}
+	sess.Unlock()
+
+	// TODO: verify the pubkey in the payment request is actually part of
+	// this session.
+
+	// Perform the LN payment to figure out the user private key.
+	sendPayReq := &lnrpc.SendRequest{
+		Amt:            int64(amount),
+		PaymentRequest: req.LnPayReq,
+	}
+	sendPayRes, err := s.cfg.LNClient.SendPaymentSync(ctx, sendPayReq)
+	if err != nil {
+		return nil, fmt.Errorf("unable to pay ln invoice: %v", err)
+	}
+	if sendPayRes.PaymentError != "" {
+		return nil, fmt.Errorf("payment error: %s", sendPayRes.PaymentError)
+	}
+	svrLog.Infof("Found out priv key %x", sendPayRes.PaymentPreimage)
+
+	sess.Lock()
+	userSess.privKeys = append(userSess.privKeys, sendPayRes.PaymentPreimage)
+	sess.nbPrivKeys += 1
+	if sess.nbPrivKeys == sess.nbLeafs {
+		// Found all mrttree leaf keys. Close it out on chain.
+		sess.privKeysReceived()
+		go s.redeemTree(sess)
+	}
+	sess.Unlock()
+
+	return &api.RedeemLeafResponse{}, nil
 }
 
 func (s *Server) UserError(context.Context, *api.UserErrorRequest) (*api.UserErrorResponse, error) {

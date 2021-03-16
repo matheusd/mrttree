@@ -8,7 +8,9 @@ import (
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrec/secp256k1/v3"
+	"github.com/decred/dcrd/dcrec/secp256k1/v3/schnorr"
 	"github.com/decred/dcrd/txscript/v3"
+	"github.com/decred/dcrd/wire"
 )
 
 func mustRead(b []byte, r io.Reader) {
@@ -72,8 +74,6 @@ type TestUser struct {
 }
 
 func (u *TestUser) GenerateNonces(tree *Tree) error {
-	u.t.Helper()
-
 	// Gather all our leaf keys.
 	leafKeys := make([]*secp256k1.PublicKey, len(u.Keys))
 	for i, k := range u.Keys {
@@ -271,6 +271,117 @@ func (u *TestUser) SignTree(allNonces map[uint32][][]byte, allFundNonces [][]byt
 	u.TreeSigs = sigs
 	u.FundSigs = fundSigs
 	return nil
+}
+
+func (u *TestUser) RedeemNode(node *Node, otherPrivs [][]byte, destPkScript []byte) (*wire.MsgTx, error) {
+	tx := wire.NewMsgTx()
+
+	// Copy the root txIn since that points to the funding tx.
+	in := *node.Tx.TxIn[0]
+	in.Sequence = wire.MaxTxInSequenceNum
+	tx.AddTxIn(&in)
+
+	// Copy the amount from the root tx since it takes care of fee as well.
+	fee := calcLeafRedeemTxFee(1e4) // TODO: parametrize fee rate
+	tx.AddTxOut(wire.NewTxOut(in.ValueIn-fee, destPkScript))
+
+	// Create a full sig using our and all other priv keys.
+
+	redeemScript, err := node.RedeemScript()
+	if err != nil {
+		return nil, err
+	}
+
+	sigHash, err := txscript.CalcSignatureHash(redeemScript,
+		txscript.SigHashAll, tx, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: instead of doing partial sigs, figure out the tweaked priv key
+	// and just sign once.
+
+	// Generate the group key and musig group tweak L.
+	leafKeys := node.SubtreeLeafKeys()
+	_, musigL, err := musigGroupKeyFromKeys(HasherTagImmediateKey, leafKeys...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a combined list of all priv keys.
+	allPrivs := make([]*secp256k1.PrivateKey, 0, len(leafKeys))
+	allPubs := make([]*secp256k1.PublicKey, 0, len(leafKeys))
+	for _, priv := range u.KeysPrivs {
+		allPrivs = append(allPrivs, priv)
+		allPubs = append(allPubs, priv.PubKey())
+	}
+	for _, privBytes := range otherPrivs {
+		priv := secp256k1.PrivKeyFromBytes(privBytes)
+		allPrivs = append(allPrivs, priv)
+		allPubs = append(allPubs, priv.PubKey())
+	}
+
+	// Sanity check we have all priv keys.
+	if len(allPrivs) != len(leafKeys) {
+		return nil, fmt.Errorf("cannot redeem root if not all keys are known")
+	}
+
+	// Generate a new group nonce.
+	noncesPrivs := make([]*secp256k1.PrivateKey, len(allPrivs))
+	nonces := make([][]byte, len(allPrivs))
+	for i := range allPrivs {
+		var p [33]byte
+		priv := randKey(u.rnd)
+		copy(p[:], priv.PubKey().SerializeCompressed())
+		noncesPrivs[i] = priv
+		nonces[i] = p[:]
+	}
+
+	// Produce the group nonce.
+	R, invertedR, err := produceR(nonces)
+	if err != nil {
+		return nil, err
+	}
+
+	// Perform each partial signature.
+	fullS := new(secp256k1.ModNScalar)
+	for i, priv := range allPrivs {
+		r := noncesPrivs[i]
+		sig, err := partialMuSigSign(R, invertedR, musigL, r, priv, sigHash)
+		if err != nil {
+			return nil, err
+		}
+
+		fullS.Add(sig)
+
+		// Verify the aggregated sig so far.
+		err = partialMuSigVerify(R, musigL, sigHash, nonces[:i+1],
+			allPubs[:i+1], fullS)
+		if err != nil {
+			return nil, fmt.Errorf("partial verify failed: %v", err)
+		}
+	}
+
+	// Finally, assemble the final signature script.
+	var Rj secp256k1.JacobianPoint
+	R.AsJacobian(&Rj)
+	sig := schnorr.NewSignature(&Rj.X, fullS)
+	_, immKey, err := node.ScriptKeys()
+	if err != nil {
+		return nil, err
+	}
+
+	if !sig.Verify(sigHash, immKey) {
+		return nil, fmt.Errorf("full sig failed to verify")
+	}
+
+	sigScript, err := sigAndScriptSigScript(sig, immKey, redeemScript)
+	if err != nil {
+		return nil, err
+	}
+	tx.TxIn[0].SignatureScript = sigScript
+
+	return tx, nil
 }
 
 func NewTestUser(t *testing.T, name string, seed int64, nbLeafs int) *TestUser {
